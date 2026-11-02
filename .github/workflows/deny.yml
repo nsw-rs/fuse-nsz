@@ -1,0 +1,44 @@
+# SPDX-FileCopyrightText: 2026 Timothy Redaelli <timothy.redaelli@gmail.com>
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+name: Cargo Deny
+
+on:
+  push:
+    branches: [ master ]
+    paths:
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'deny.toml'
+  pull_request:
+    branches: [ master ]
+    paths:
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'deny.toml'
+  schedule:
+    - cron: '0 0 * * *' # Daily at 00:00 UTC (advisories DB refresh)
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  deny:
+    name: Cargo Deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check licenses, bans, advisories and sources
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --all-features
+          manifest-path: Cargo.toml

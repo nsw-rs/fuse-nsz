@@ -22,6 +22,9 @@ ignore = [
     # winfsp_wrs_sys, which reads the WinFsp install directory from the
     # Windows registry at build time; it is not in the binary.
     { id = "RUSTSEC-2025-0026", reason = "build-time only, reads the WinFsp install directory" },
+    # zstd-sys before 2.0.10 on wasm32 only. libhac pins this exact libzstd
+    # so its NCZ output stays the same, and wasm32 is not a target.
+    { id = "RUSTSEC-2026-0410", reason = "wasm32 only; pinned by libhac" },
 ]
 
 # ---------------------------------------------------------------------------

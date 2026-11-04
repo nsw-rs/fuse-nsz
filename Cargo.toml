@@ -23,7 +23,7 @@ pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ targe
 bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext }"
 
 [dependencies]
-libhac = { version = "0.1.0", features = ["ncz"] }
+libhac = { version = "0.1.2", features = ["ncz"] }
 
 [target.'cfg(unix)'.dependencies]
 fuser = "0.18.0"

@@ -5,34 +5,60 @@
 //! WinFsp backend for Windows. WinFsp passes paths like `\dir\file`, which
 //! map directly onto the core.
 
-use crate::vfs::{FsError, Handle, Node, Vfs};
+use crate::vfs::{self, FsError, Handle, Node, Options, Vfs, lock};
 use std::ffi::OsString;
-use std::os::windows::ffi::OsStringExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
-use std::time::SystemTime;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
 use winfsp_wrs::{
-    CreateFileInfo, CreateOptions, DirInfo, FileAccessRights, FileAttributes, FileInfo, FileSystem,
-    FileSystemInterface, NTSTATUS, PSecurityDescriptor, Params, STATUS_ACCESS_DENIED,
-    STATUS_END_OF_FILE, STATUS_FILE_IS_A_DIRECTORY, STATUS_IO_DEVICE_ERROR,
-    STATUS_MEDIA_WRITE_PROTECTED, STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND,
-    SecurityDescriptor, U16CStr, U16CString, U16Str, VolumeInfo, u16cstr,
+    CleanupFlags, CreateFileInfo, CreateOptions, DirInfo, ERROR_DIR_NOT_EMPTY, ERROR_DISK_FULL,
+    ERROR_HANDLE_DISK_FULL, ERROR_SHARING_VIOLATION, FileAccessRights, FileAttributes, FileInfo,
+    FileSystem, FileSystemInterface, NTSTATUS, PSecurityDescriptor, Params, STATUS_ACCESS_DENIED,
+    STATUS_DIRECTORY_NOT_EMPTY, STATUS_DISK_FULL, STATUS_END_OF_FILE, STATUS_FILE_IS_A_DIRECTORY,
+    STATUS_IO_DEVICE_ERROR, STATUS_MEDIA_WRITE_PROTECTED, STATUS_NOT_A_DIRECTORY,
+    STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_SHARING_VIOLATION,
+    SecurityDescriptor, U16CStr, U16CString, U16Str, VolumeInfo, WriteMode, u16cstr,
 };
 
-/// Read and execute for everyone. The volume is read-only anyway.
-const SDDL: &U16CStr = u16cstr!("O:BAG:BAD:P(A;;FRFX;;;WD)");
+/// Read and execute for everyone, on a read-only volume.
+const SDDL_RO: &U16CStr = u16cstr!("O:BAG:BAD:P(A;;FRFX;;;WD)");
+/// Full access for everyone, on a read-write volume.
+const SDDL_RW: &U16CStr = u16cstr!("O:BAG:BAD:P(A;;FA;;;WD)");
+/// A virtual image on a read-write volume: read and execute, plus delete
+/// and write attributes so it can be renamed, deleted and touched. Without
+/// write data, an open asking for the most access allowed still gets a
+/// read-only handle.
+const SDDL_IMAGE: &U16CStr = u16cstr!("O:BAG:BAD:P(A;;0x1301a9;;;WD)");
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetDiskFreeSpaceExW(
+        dir: *const u16,
+        free_to_caller: *mut u64,
+        total: *mut u64,
+        free: *mut u64,
+    ) -> i32;
+}
 
 /// Win32 epoch (1601) to Unix epoch, in 100 ns units.
 const EPOCH_AS_FILETIME: u64 = 116_444_736_000_000_000;
 
-fn status(e: &FsError) -> NTSTATUS {
+fn status(e: FsError) -> NTSTATUS {
     match e {
         FsError::NotFound => STATUS_OBJECT_NAME_NOT_FOUND,
         FsError::ReadOnly => STATUS_MEDIA_WRITE_PROTECTED,
+        FsError::Denied => STATUS_ACCESS_DENIED,
+        FsError::Exists => STATUS_OBJECT_NAME_COLLISION,
         FsError::IsDir => STATUS_FILE_IS_A_DIRECTORY,
         FsError::NotDir => STATUS_NOT_A_DIRECTORY,
         FsError::Access => STATUS_ACCESS_DENIED,
-        FsError::Io(_) => STATUS_IO_DEVICE_ERROR,
+        FsError::Io(e) => match e.raw_os_error().and_then(|c| u32::try_from(c).ok()) {
+            Some(ERROR_DIR_NOT_EMPTY) => STATUS_DIRECTORY_NOT_EMPTY,
+            Some(ERROR_SHARING_VIOLATION) => STATUS_SHARING_VIOLATION,
+            Some(ERROR_DISK_FULL | ERROR_HANDLE_DISK_FULL) => STATUS_DISK_FULL,
+            _ => STATUS_IO_DEVICE_ERROR,
+        },
     }
 }
 
@@ -49,13 +75,29 @@ fn filetime(t: SystemTime) -> u64 {
     (d.as_nanos() / 100) as u64 + EPOCH_AS_FILETIME
 }
 
-fn file_info(node: &Node) -> FileInfo {
+/// A FILETIME as a time to set; 0 and all ones mean "leave as is".
+fn systime(ft: u64) -> Option<SystemTime> {
+    if ft == 0 || ft == u64::MAX {
+        return None;
+    }
+    let d = |n: u64| Duration::from_nanos(n.saturating_mul(100));
+    match ft.checked_sub(EPOCH_AS_FILETIME) {
+        Some(n) => SystemTime::UNIX_EPOCH.checked_add(d(n)),
+        None => SystemTime::UNIX_EPOCH.checked_sub(d(EPOCH_AS_FILETIME - ft)),
+    }
+}
+
+/// Info of `node`. In rw mode only a read-only source shows the read-only
+/// attribute: with it, Windows refuses to rename or delete the file.
+fn file_info(node: &Node, rw: bool) -> FileInfo {
     let mut fi = FileInfo::default();
     let size = node.size();
     let attrs = if node.is_dir() {
         FileAttributes::DIRECTORY
-    } else {
+    } else if !rw || node.meta.permissions().readonly() {
         FileAttributes::READONLY
+    } else {
+        FileAttributes::NORMAL
     };
     let t = filetime(node.mtime());
     fi.set_file_attributes(attrs)
@@ -68,26 +110,77 @@ fn file_info(node: &Node) -> FileInfo {
 
 /// An open file or directory.
 struct Ctx {
-    path: PathBuf,
-    info: FileInfo,
+    /// Changed by a rename.
+    path: Mutex<PathBuf>,
+    /// Read again after every change.
+    info: Mutex<FileInfo>,
     /// `None` for a directory.
     handle: Option<Handle>,
     /// Directory listing, sorted by name, taken on the first read.
     listing: OnceLock<Vec<(U16CString, FileInfo)>>,
 }
 
+impl Ctx {
+    fn new(path: PathBuf, info: FileInfo, handle: Option<Handle>) -> Arc<Ctx> {
+        Arc::new(Ctx {
+            path: Mutex::new(path),
+            info: Mutex::new(info),
+            handle,
+            listing: OnceLock::new(),
+        })
+    }
+
+    fn path(&self) -> PathBuf {
+        lock(&self.path).clone()
+    }
+
+    fn file(&self) -> Result<&Handle, NTSTATUS> {
+        self.handle.as_ref().ok_or(STATUS_FILE_IS_A_DIRECTORY)
+    }
+}
+
 struct NszFs {
     vfs: Vfs,
     security: SecurityDescriptor,
+    /// For virtual images in rw mode.
+    image_security: SecurityDescriptor,
 }
 
 impl NszFs {
+    fn security(&self, image: bool) -> PSecurityDescriptor {
+        if image && self.vfs.rw() {
+            self.image_security.as_ptr()
+        } else {
+            self.security.as_ptr()
+        }
+    }
+
+    fn info(&self, node: &Node) -> FileInfo {
+        file_info(node, self.vfs.rw())
+    }
+
+    /// Info of `ctx` read again after a change.
+    fn refresh(&self, ctx: &Ctx) -> Result<FileInfo, NTSTATUS> {
+        let node = match &ctx.handle {
+            Some(Handle::File(f)) => Node {
+                meta: f.metadata().map_err(|e| status(e.into()))?,
+                image: None,
+            },
+            _ => self.vfs.lookup(&ctx.path()).map_err(status)?,
+        };
+        let info = self.info(&node);
+        *lock(&ctx.info) = info;
+        Ok(info)
+    }
+
     fn listing(&self, ctx: &Ctx) -> Result<Vec<(U16CString, FileInfo)>, NTSTATUS> {
-        let entries = self.vfs.read_dir(&ctx.path).map_err(|e| status(&e))?;
+        let path = ctx.path();
+        let entries = self.vfs.read_dir(&path).map_err(status)?;
         let mut out = Vec::with_capacity(entries.len() + 2);
-        if !ctx.path.as_os_str().is_empty() {
+        if !path.as_os_str().is_empty() {
+            let info = *lock(&ctx.info);
             for dot in [".", ".."] {
-                out.push((U16CString::from_str_truncate(dot), ctx.info));
+                out.push((U16CString::from_str_truncate(dot), info));
             }
         }
         for e in entries {
@@ -97,7 +190,7 @@ impl NszFs {
             let Ok(name) = U16CString::from_os_str(&e.name) else {
                 continue;
             };
-            out.push((name, file_info(node)));
+            out.push((name, self.info(node)));
         }
         out.sort_by(|a, b| a.0.as_slice().cmp(b.0.as_slice()));
         Ok(out)
@@ -118,9 +211,30 @@ impl FileSystemInterface for NszFs {
     const GET_FILE_INFO_DEFINED: bool = true;
     const GET_SECURITY_DEFINED: bool = true;
     const READ_DIRECTORY_DEFINED: bool = true;
+    const CLEANUP_DEFINED: bool = true;
+    const WRITE_DEFINED: bool = true;
+    const FLUSH_DEFINED: bool = true;
+    const SET_BASIC_INFO_DEFINED: bool = true;
+    const SET_FILE_SIZE_DEFINED: bool = true;
+    const CAN_DELETE_DEFINED: bool = true;
+    const RENAME_DEFINED: bool = true;
 
+    /// The source volume's numbers: Windows refuses to copy onto a volume
+    /// that reports no free space.
     fn get_volume_info(&self) -> Result<VolumeInfo, NTSTATUS> {
-        VolumeInfo::new(0, 0, U16Str::from_slice(&[])).map_err(|_| STATUS_IO_DEVICE_ERROR)
+        let mut root: Vec<u16> = self.vfs.root().as_os_str().encode_wide().collect();
+        // A UNC path (a source on a network share) must end with a
+        // backslash.
+        if root.last() != Some(&u16::from(b'\\')) {
+            root.push(u16::from(b'\\'));
+        }
+        root.push(0);
+        let (mut avail, mut total, mut free) = (0, 0, 0);
+        // SAFETY: `root` is NUL terminated and the outputs are valid u64s.
+        if unsafe { GetDiskFreeSpaceExW(root.as_ptr(), &mut avail, &mut total, &mut free) } == 0 {
+            (avail, total) = (0, 0);
+        }
+        VolumeInfo::new(total, avail, U16Str::from_slice(&[])).map_err(|_| STATUS_IO_DEVICE_ERROR)
     }
 
     fn get_security_by_name(
@@ -128,31 +242,47 @@ impl FileSystemInterface for NszFs {
         file_name: &U16CStr,
         _find_reparse_point: impl Fn() -> Option<FileAttributes>,
     ) -> Result<(FileAttributes, PSecurityDescriptor, bool), NTSTATUS> {
-        let node = self.vfs.lookup(&rel(file_name)).map_err(|e| status(&e))?;
+        let node = self.vfs.lookup(&rel(file_name)).map_err(status)?;
         Ok((
-            file_info(&node).file_attributes(),
-            self.security.as_ptr(),
+            self.info(&node).file_attributes(),
+            self.security(node.image.is_some()),
             false,
         ))
     }
 
     fn create(
         &self,
-        _file_name: &U16CStr,
-        _create_file_info: CreateFileInfo,
+        file_name: &U16CStr,
+        create_file_info: CreateFileInfo,
         _security_descriptor: SecurityDescriptor,
     ) -> Result<(Self::FileContext, FileInfo), NTSTATUS> {
-        Err(STATUS_MEDIA_WRITE_PROTECTED)
+        let path = rel(file_name);
+        let (node, handle) = if create_file_info
+            .create_options
+            .is(CreateOptions::FILE_DIRECTORY_FILE)
+        {
+            (self.vfs.mkdir(&path, 0o777).map_err(status)?, None)
+        } else {
+            let (node, h) = self.vfs.create(&path, 0o666).map_err(status)?;
+            (node, Some(h))
+        };
+        let info = self.info(&node);
+        Ok((Ctx::new(path, info, handle), info))
     }
 
+    /// Truncate on open (supersede or overwrite dispositions).
     fn overwrite(
         &self,
-        _file_context: Self::FileContext,
+        ctx: Self::FileContext,
         _file_attributes: FileAttributes,
         _replace_file_attributes: bool,
         _allocation_size: u64,
     ) -> Result<FileInfo, NTSTATUS> {
-        Err(STATUS_MEDIA_WRITE_PROTECTED)
+        if !self.vfs.rw() {
+            return Err(STATUS_MEDIA_WRITE_PROTECTED);
+        }
+        ctx.file()?.set_len(0).map_err(status)?;
+        self.refresh(&ctx)
     }
 
     fn open(
@@ -162,8 +292,8 @@ impl FileSystemInterface for NszFs {
         granted_access: FileAccessRights,
     ) -> Result<(Self::FileContext, FileInfo), NTSTATUS> {
         let path = rel(file_name);
-        let node = self.vfs.lookup(&path).map_err(|e| status(&e))?;
-        let info = file_info(&node);
+        let node = self.vfs.lookup(&path).map_err(status)?;
+        let info = self.info(&node);
         let handle = if node.is_dir() {
             if create_options.is(CreateOptions::FILE_NON_DIRECTORY_FILE) {
                 return Err(STATUS_FILE_IS_A_DIRECTORY);
@@ -175,18 +305,65 @@ impl FileSystemInterface for NszFs {
             }
             let write = granted_access.is(FileAccessRights::FILE_WRITE_DATA)
                 || granted_access.is(FileAccessRights::FILE_APPEND_DATA);
-            Some(self.vfs.open(&path, node, write).map_err(|e| status(&e))?)
+            let image = node.image.is_some();
+            let r = match self.vfs.open(&path, node.clone(), write, false) {
+                // The security descriptor grants write data, so an open
+                // asking for MAXIMUM_ALLOWED gets it even on a source the
+                // user can only read (read-only attribute or share). Open
+                // it read-only then: a write through it fails instead.
+                Err(FsError::Access) if write && !image => self.vfs.open(&path, node, false, false),
+                r => r,
+            };
+            Some(r.map_err(status)?)
         };
-        let ctx = Ctx {
-            path,
-            info,
-            handle,
-            listing: OnceLock::new(),
+        Ok((Ctx::new(path, info, handle), info))
+    }
+
+    /// The last handle of a file is closed: delete it if asked to.
+    fn cleanup(&self, ctx: Self::FileContext, _file_name: Option<&U16CStr>, flags: CleanupFlags) {
+        if !flags.is(CleanupFlags::DELETE) {
+            return;
+        }
+        let path = ctx.path();
+        let r = if ctx.handle.is_some() {
+            self.vfs.unlink(&path).map(drop)
+        } else {
+            self.vfs.rmdir(&path)
         };
-        Ok((Arc::new(ctx), info))
+        if let Err(e) = r {
+            eprintln!("{}: delete: {e:?}", path.display());
+        }
     }
 
     fn close(&self, _file_context: Self::FileContext) {}
+
+    fn write(
+        &self,
+        ctx: Self::FileContext,
+        buffer: &[u8],
+        mode: WriteMode,
+    ) -> Result<(usize, FileInfo), NTSTATUS> {
+        let h = ctx.file()?;
+        let (off, len) = match mode {
+            WriteMode::Normal { offset } => (offset, buffer.len()),
+            WriteMode::ConstrainedIO { offset } => {
+                // Never past the end of file.
+                let left = self.refresh(&ctx)?.file_size().saturating_sub(offset);
+                let len = usize::try_from(left).map_or(buffer.len(), |l| l.min(buffer.len()));
+                (offset, len)
+            }
+            WriteMode::WriteToEOF => (self.refresh(&ctx)?.file_size(), buffer.len()),
+        };
+        h.write(off, &buffer[..len]).map_err(status)?;
+        Ok((len, self.refresh(&ctx)?))
+    }
+
+    fn flush(&self, ctx: Self::FileContext) -> Result<FileInfo, NTSTATUS> {
+        if let Some(h) = &ctx.handle {
+            h.sync().map_err(status)?;
+        }
+        self.refresh(&ctx)
+    }
 
     fn read(
         &self,
@@ -203,7 +380,7 @@ impl FileSystemInterface for NszFs {
             Err(e) => {
                 eprintln!(
                     "{}: read {}@{offset}: {e}",
-                    ctx.path.display(),
+                    ctx.path().display(),
                     buffer.len()
                 );
                 Err(STATUS_IO_DEVICE_ERROR)
@@ -212,11 +389,79 @@ impl FileSystemInterface for NszFs {
     }
 
     fn get_file_info(&self, ctx: Self::FileContext) -> Result<FileInfo, NTSTATUS> {
-        Ok(ctx.info)
+        Ok(*lock(&ctx.info))
     }
 
-    fn get_security(&self, _ctx: Self::FileContext) -> Result<PSecurityDescriptor, NTSTATUS> {
-        Ok(self.security.as_ptr())
+    /// Times and the read-only attribute. For a virtual image they apply
+    /// to its source.
+    fn set_basic_info(
+        &self,
+        ctx: Self::FileContext,
+        file_attributes: FileAttributes,
+        _creation_time: u64,
+        last_access_time: u64,
+        last_write_time: u64,
+        _change_time: u64,
+    ) -> Result<FileInfo, NTSTATUS> {
+        let path = ctx.path();
+        if file_attributes != FileAttributes::INVALID {
+            let node = self.vfs.lookup(&path).map_err(status)?;
+            let ro = file_attributes.is(FileAttributes::READONLY);
+            let mut perm = node.meta.permissions();
+            if !node.is_dir() && perm.readonly() != ro {
+                perm.set_readonly(ro);
+                self.vfs.set_permissions(&path, perm).map_err(status)?;
+            }
+        }
+        let (atime, mtime) = (systime(last_access_time), systime(last_write_time));
+        if atime.is_some() || mtime.is_some() {
+            self.vfs.set_times(&path, atime, mtime).map_err(status)?;
+        }
+        self.refresh(&ctx)
+    }
+
+    fn set_file_size(
+        &self,
+        ctx: Self::FileContext,
+        new_size: u64,
+        set_allocation_size: bool,
+    ) -> Result<FileInfo, NTSTATUS> {
+        let h = ctx.file()?;
+        // Allocation is not tracked: only a size below the file's end
+        // truncates it.
+        if !set_allocation_size || new_size < lock(&ctx.info).file_size() {
+            h.set_len(new_size).map_err(status)?;
+        }
+        self.refresh(&ctx)
+    }
+
+    fn can_delete(&self, ctx: Self::FileContext, _file_name: &U16CStr) -> Result<(), NTSTATUS> {
+        if !self.vfs.rw() {
+            return Err(STATUS_MEDIA_WRITE_PROTECTED);
+        }
+        if ctx.handle.is_none() && !self.vfs.is_empty_dir(&ctx.path()).map_err(status)? {
+            return Err(STATUS_DIRECTORY_NOT_EMPTY);
+        }
+        Ok(())
+    }
+
+    fn rename(
+        &self,
+        ctx: Self::FileContext,
+        file_name: &U16CStr,
+        new_file_name: &U16CStr,
+        replace_if_exists: bool,
+    ) -> Result<(), NTSTATUS> {
+        let to = rel(new_file_name);
+        self.vfs
+            .rename(&rel(file_name), &to, !replace_if_exists)
+            .map_err(status)?;
+        *lock(&ctx.path) = to;
+        Ok(())
+    }
+
+    fn get_security(&self, ctx: Self::FileContext) -> Result<PSecurityDescriptor, NTSTATUS> {
+        Ok(self.security(matches!(ctx.handle, Some(Handle::Image(_)))))
     }
 
     fn read_directory(
@@ -251,11 +496,15 @@ impl FileSystemInterface for NszFs {
 /// Mount `src` on `mountpoint` (a drive letter like `X:` or a directory
 /// that does not exist yet) and serve it until the process is stopped.
 pub fn mount(src: PathBuf, mountpoint: &Path, args: &[String]) -> Result<(), String> {
-    if let Some(a) = args.first() {
-        return Err(format!("unknown argument {a}"));
+    let mut opts = Options::default();
+    for o in vfs::mount_options(args)? {
+        if !opts.parse_flag(o) {
+            return Err(format!("unknown option {o}"));
+        }
     }
     winfsp_wrs::init().map_err(|e| e.to_string())?;
-    let security = SecurityDescriptor::from_wstr(SDDL)?;
+    let security = SecurityDescriptor::from_wstr(if opts.rw { SDDL_RW } else { SDDL_RO })?;
+    let image_security = SecurityDescriptor::from_wstr(SDDL_IMAGE)?;
     let mut params = Params::default();
     let vp = &mut params.volume_params;
     vp.set_sector_size(4096)
@@ -265,14 +514,15 @@ pub fn mount(src: PathBuf, mountpoint: &Path, args: &[String]) -> Result<(), Str
         .set_case_preserved_names(true)
         .set_unicode_on_disk(true)
         .set_persistent_acls(true)
-        .set_read_only_volume(true)
+        .set_read_only_volume(!opts.rw)
         .set_file_info_timeout(1000);
     let _ = vp.set_file_system_name(u16cstr!("fuse-nsz"));
     let mp = U16CString::from_os_str(mountpoint)
         .map_err(|_| format!("{}: invalid mountpoint", mountpoint.display()))?;
     let fs = NszFs {
-        vfs: Vfs::new(src),
+        vfs: Vfs::new(src, opts),
         security,
+        image_security,
     };
     let _host = FileSystem::start(params, Some(&mp), fs)
         .map_err(|s| format!("{}: cannot mount (NTSTATUS {s:#x})", mountpoint.display()))?;

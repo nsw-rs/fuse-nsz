@@ -2,9 +2,10 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! fuse-nsz mounts a directory read-only and exposes every block compressed
+//! fuse-nsz mirrors a directory and exposes every block compressed
 //! `.nsz`/`.xcz` in it also as a virtual `.nsp`/`.xci`, decompressed on the
-//! fly.
+//! fly. The mount is read-only unless `-o rw` is given; `-o hide_sources`
+//! leaves out the sources whose virtual files are shown.
 
 #[cfg(unix)]
 mod unix;
@@ -27,7 +28,7 @@ fn main() -> ExitCode {
     if args.len() < 3 {
         let prog = args.first().map(Path::new).and_then(Path::file_name);
         let prog = prog.map_or("fuse-nsz".into(), |p| p.to_string_lossy());
-        eprintln!("usage: {prog} <srcdir> <mountpoint> [fuse options]");
+        eprintln!("usage: {prog} <srcdir> <mountpoint> [-o rw,hide_sources,...]");
         return ExitCode::from(2);
     }
     let mut opts = Vec::with_capacity(args.len() - 3);

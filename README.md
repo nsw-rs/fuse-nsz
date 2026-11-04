@@ -6,8 +6,9 @@ SPDX-License-Identifier: MIT OR Apache-2.0
 
 # fuse-nsz
 
-A read-only FUSE filesystem that mirrors a directory and shows every
-block compressed `.nsz`/`.xcz` file in it as a plain `.nsp`/`.xci` too.
+A FUSE filesystem that mirrors a directory and shows every block
+compressed `.nsz`/`.xcz` file in it as a plain `.nsp`/`.xci` too.
+It is read-only unless mounted with `-o rw`.
 The virtual files are decompressed on the fly, so you can keep only the
 compressed copies on disk and still feed the uncompressed images to
 tools that do not understand NSZ.
@@ -59,8 +60,10 @@ contributors. This tool only reads what `nsz` writes.
 - If the source directory already holds `game.nsp` next to `game.nsz`,
   the real file wins and the virtual one is hidden. Mount a directory
   that contains only the compressed files to avoid surprises.
-- Read-only. Any open for writing fails with `EROFS` (access denied on
-  Windows).
+- Read-only by default: any change fails with `EROFS` (write protected
+  on Windows). See [Read-write mode](#read-write-mode).
+- The content of a virtual file can never be written, also in `rw`
+  mode: there is no compression on write.
 - Names that are not valid UTF-8 are passed through, but never get a
   virtual file.
 
@@ -105,8 +108,9 @@ umount ~/mnt/switch            # macOS
 
 Ctrl-C (SIGINT), SIGTERM and SIGHUP also unmount it.
 
-On Linux and macOS the mount uses `-o ro,fsname=fuse-nsz`. Options given
-with `-o` after the mountpoint are added, for example:
+On Linux and macOS the mount uses
+`-o ro,fsname=fuse-nsz,default_permissions` (`rw` replaces `ro`). Options
+given with `-o` after the mountpoint are added, for example:
 
 ```sh
 fuse-nsz ~/switch/nsz ~/mnt/switch -o allow_other
@@ -114,7 +118,40 @@ fuse-nsz ~/switch/nsz ~/mnt/switch -o allow_other
 
 On Windows the mountpoint is a free drive letter (`X:`) or a directory
 that does not exist yet. Files are readable by everyone. Stop it with
-Ctrl-C.
+Ctrl-C. Of the options, only `ro`, `rw` and `hide_sources` are accepted
+there.
+
+### Hiding the sources
+
+With `-o hide_sources`, a `.nsz`/`.xcz` whose virtual file is shown is
+left out of the mount, so only `game.nsp` is visible instead of both
+`game.nsz` and `game.nsp`. Sources that are not exposed (solid NCZ, broken
+files, or a real `game.nsp` next to them) stay visible. It works in
+read-only mode too.
+
+### Read-write mode
+
+With `-o rw` the mirror passes changes through to the source directory:
+
+- Real files and directories: create, write, truncate, rename, delete,
+  `mkdir`, `rmdir`, `chmod` and `touch` work as usual.
+- A virtual file can be renamed, moved and deleted: the operation applies
+  to its source. A rename must keep a virtual extension (`game.nsp` to
+  `other.nsp`, which renames `game.nsz` to `other.nsz`); any other name is
+  refused with `EACCES`. `chmod` and `touch` apply to the source too.
+- Opening a virtual file for writing or truncating it fails with
+  `EACCES` (access denied on Windows).
+- Replacing a virtual file or a hidden source with a rename is refused,
+  since that would leave the source behind or delete it.
+- `chown` fails with `EPERM`: every file belongs to the user that
+  mounted it.
+
+Virtual files show the write permission in `rw` mode.
+
+On Windows, the security descriptor of a virtual file grants no write
+access to its data. .NET Framework (Windows PowerShell 5.1) sets file
+times through a write open, so setting `LastWriteTime` on a virtual file
+fails there; tools that open with `FILE_WRITE_ATTRIBUTES` only work.
 
 ## Creating compatible archives
 

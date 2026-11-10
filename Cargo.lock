@@ -404,9 +404,9 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libhac"
-version = "0.1.2"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "818ebc19658c03f0cf1e0b0e118fa80066e5efa70d9ca7c9dd1b239433a1a999"
+checksum = "9feb690ed079629a91daa298c06b4f8c3054ccbbcabccf155e04abcfaaa75608"
 dependencies = [
  "aes",
  "hex",

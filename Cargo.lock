@@ -217,6 +217,7 @@ dependencies = [
  "sha2",
  "signal-hook",
  "winfsp_wrs",
+ "winfsp_wrs_sys",
 ]
 
 [[package]]

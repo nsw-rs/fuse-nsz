@@ -3,10 +3,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! FUSE backend for Linux and macOS. The kernel speaks in inode numbers,
-//! the core in paths: a table maps each path seen so far to an inode.
+//! the core in paths: a table maps each inode the kernel holds to its path.
 //! Inode numbers are never reused, so the generation is always 0.
 
-use crate::vfs::{self, FsError, Handle, Node, Options, Vfs, lock};
+use crate::vfs::{self, FsError, Handle, Node, Options, Vfs, lock, log};
 use fuser::{
     BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
     Generation, INodeNo, LockOwner, MountOption, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr,
@@ -18,33 +18,97 @@ use std::ffi::{OsStr, OsString};
 use std::fs::Permissions;
 use std::io;
 use std::ops::Bound;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 const TTL: Duration = Duration::from_secs(1);
 
-#[derive(Default)]
+/// An inode the kernel holds, or one that an open listing shows.
+struct Inode {
+    /// `None` once the entry was deleted or replaced: an open file may
+    /// still use the inode, but no name leads to it.
+    path: Option<PathBuf>,
+    /// Lookups the kernel did not forget yet. 0 for an entry that was only
+    /// listed so far.
+    lookups: u64,
+}
+
 struct Inodes {
-    /// Path of inode `i + 1`. Inode 1 is the root, the empty path.
-    paths: Vec<PathBuf>,
-    /// Ordered, so a directory and everything under it are one range.
+    /// The last number given out.
+    last: u64,
+    nodes: HashMap<u64, Inode>,
+    /// The inodes that have a name. Ordered, so a directory and everything
+    /// under it are one range.
     by_path: BTreeMap<PathBuf, u64>,
 }
 
 impl Inodes {
-    fn ino(&mut self, path: &Path) -> INodeNo {
+    /// Only the root, the empty path, which the kernel never forgets.
+    fn new() -> Self {
+        let root = Inode {
+            path: Some(PathBuf::new()),
+            lookups: 1,
+        };
+        Inodes {
+            last: INodeNo::ROOT.0,
+            nodes: HashMap::from([(INodeNo::ROOT.0, root)]),
+            by_path: BTreeMap::from([(PathBuf::new(), INodeNo::ROOT.0)]),
+        }
+    }
+
+    /// The inode of `path` for a listing. That is no lookup: an entry the
+    /// kernel does not look up is dropped again when the listing is closed,
+    /// see [`Inodes::forget`].
+    fn list(&mut self, path: &Path) -> INodeNo {
         if let Some(&ino) = self.by_path.get(path) {
             return INodeNo(ino);
         }
-        self.paths.push(path.to_path_buf());
-        let ino = self.paths.len() as u64;
-        self.by_path.insert(path.to_path_buf(), ino);
-        INodeNo(ino)
+        self.last += 1;
+        self.by_path.insert(path.to_path_buf(), self.last);
+        let node = Inode {
+            path: Some(path.to_path_buf()),
+            lookups: 0,
+        };
+        self.nodes.insert(self.last, node);
+        INodeNo(self.last)
     }
 
-    /// The live paths `path` and everything under it, with their inodes.
+    /// The inode of `path` for an entry reply. Each reply is one lookup,
+    /// which the kernel hands back with a forget.
+    fn lookup(&mut self, path: &Path) -> INodeNo {
+        let ino = self.list(path);
+        if let Some(node) = self.nodes.get_mut(&ino.0) {
+            node.lookups += 1;
+        }
+        ino
+    }
+
+    /// The path of `ino`, unless no name leads to it any more.
+    fn path(&self, ino: INodeNo) -> Option<&Path> {
+        self.nodes.get(&ino.0)?.path.as_deref()
+    }
+
+    /// The kernel let go of `count` lookups of `ino`. An inode without
+    /// lookups leaves the table. With a count of 0 this drops what was
+    /// only listed.
+    fn forget(&mut self, ino: INodeNo, count: u64) {
+        let Some(node) = self.nodes.get_mut(&ino.0) else {
+            return;
+        };
+        node.lookups = node.lookups.saturating_sub(count);
+        if node.lookups == 0
+            && ino != INodeNo::ROOT
+            && let Some(node) = self.nodes.remove(&ino.0)
+            && let Some(path) = node.path
+        {
+            self.by_path.remove(&path);
+        }
+    }
+
+    /// The named paths `path` and everything under it, with their inodes.
     fn subtree(&self, path: &Path) -> Vec<(PathBuf, u64)> {
         self.by_path
             .range::<Path, _>((Bound::Included(path), Bound::Unbounded))
@@ -53,11 +117,15 @@ impl Inodes {
             .collect()
     }
 
-    /// Forget the paths `path` and everything under it, so they get new
-    /// inodes if they show up again.
+    /// Take the names of `path` and of everything under it away, so they
+    /// get new inodes if they show up again. The inodes stay for the files
+    /// still open, until the kernel forgets them.
     fn remove(&mut self, path: &Path) {
-        for (p, _) in self.subtree(path) {
+        for (p, ino) in self.subtree(path) {
             self.by_path.remove(&p);
+            if let Some(node) = self.nodes.get_mut(&ino) {
+                node.path = None;
+            }
         }
     }
 
@@ -65,8 +133,6 @@ impl Inodes {
     /// open files and the kernel's cached entries keep working.
     fn rename(&mut self, old: &Path, new: &Path) {
         self.remove(new);
-        // Only the live names: an inode removed earlier keeps its old path
-        // in `paths` and must not get a name again.
         for (p, ino) in self.subtree(old) {
             let Ok(rest) = p.strip_prefix(old) else {
                 continue;
@@ -78,7 +144,9 @@ impl Inodes {
             };
             self.by_path.remove(&p);
             self.by_path.insert(np.clone(), ino);
-            self.paths[ino as usize - 1] = np;
+            if let Some(node) = self.nodes.get_mut(&ino) {
+                node.path = Some(np);
+            }
         }
     }
 }
@@ -86,7 +154,8 @@ impl Inodes {
 struct NszFs {
     vfs: Vfs,
     inodes: Mutex<Inodes>,
-    files: Mutex<Handles<Arc<Handle>>>,
+    /// Each open file with its inode.
+    files: Mutex<Handles<(INodeNo, Arc<Handle>)>>,
     dirs: Mutex<Handles<Arc<Listing>>>,
     uid: u32,
     gid: u32,
@@ -115,8 +184,20 @@ impl<T: Clone> Handles<T> {
     fn get(&self, fh: FileHandle) -> Option<T> {
         self.map.get(&fh.0).cloned()
     }
-    fn remove(&mut self, fh: FileHandle) {
-        self.map.remove(&fh.0);
+    fn remove(&mut self, fh: FileHandle) -> Option<T> {
+        self.map.remove(&fh.0)
+    }
+}
+
+/// How the mount shows `node`. A FIFO, socket or device shows as a file
+/// that cannot be opened.
+fn kind(node: &Node) -> FileType {
+    if node.is_dir() {
+        FileType::Directory
+    } else if !node.is_image() && node.meta.is_symlink() {
+        FileType::Symlink
+    } else {
+        FileType::RegularFile
     }
 }
 
@@ -135,15 +216,49 @@ fn errno(e: FsError) -> Errno {
 
 impl NszFs {
     fn path(&self, ino: INodeNo) -> Option<PathBuf> {
-        let inodes = lock(&self.inodes);
-        let i = usize::try_from(ino.0).ok()?.checked_sub(1)?;
-        inodes.paths.get(i).cloned()
+        lock(&self.inodes).path(ino).map(Path::to_path_buf)
+    }
+
+    fn file(&self, fh: FileHandle) -> Option<Arc<Handle>> {
+        lock(&self.files).get(fh).map(|(_, h)| h)
+    }
+
+    /// The node of `ino`. A file that was deleted while open has no name
+    /// to look up, so one of its open handles answers. The kernel sends
+    /// none along for an fstat.
+    fn node(&self, ino: INodeNo) -> Result<Node, Errno> {
+        if let Some(path) = self.path(ino) {
+            return self.vfs.lookup(&path).map_err(errno);
+        }
+        let files = lock(&self.files);
+        let open = files.map.values().find(|(i, _)| *i == ino);
+        let h = open.map(|(_, h)| Arc::clone(h)).ok_or(Errno::ENOENT)?;
+        drop(files);
+        match &*h {
+            Handle::File(f) => Ok(Node {
+                meta: f.metadata().map_err(|e| errno(e.into()))?,
+                image_len: None,
+            }),
+            // Its source is gone, and the metadata with it.
+            Handle::Image(_) => Err(Errno::ENOENT),
+        }
     }
 
     fn attr(&self, ino: INodeNo, node: &Node) -> FileAttr {
         let dir = node.is_dir();
         let size = node.size();
         let t = node.mtime();
+        // The permission bits and the sticky bit of the source. Samba
+        // takes a file without the w bit for a DOS read-only one and
+        // refuses to delete or rename it, so in rw mode virtual files show
+        // it too. Their content stays read-only.
+        let mut perm = node.meta.permissions().mode() & if self.vfs.rw() { 0o1777 } else { 0o1555 };
+        // Every file is shown with the group of the mounting user. Where
+        // the source has another group, its group bits would go to the
+        // wrong users: that class gets no more than everyone else.
+        if node.meta.gid() != self.gid {
+            perm &= !0o070 | (perm & 0o007) << 3;
+        }
         FileAttr {
             ino,
             size,
@@ -154,16 +269,8 @@ impl NszFs {
             mtime: t,
             ctime: t,
             crtime: t,
-            kind: if dir {
-                FileType::Directory
-            } else {
-                FileType::RegularFile
-            },
-            // Samba takes a file without the w bit for a DOS read-only one
-            // and refuses to delete or rename it, so in rw mode virtual
-            // files show it too. Their content stays read-only.
-            perm: (node.meta.permissions().mode() & if self.vfs.rw() { 0o777 } else { 0o555 })
-                as u16,
+            kind: kind(node),
+            perm: perm as u16,
             nlink: if dir { 2 } else { 1 },
             uid: self.uid,
             gid: self.gid,
@@ -179,7 +286,7 @@ impl NszFs {
     }
 
     fn reply_entry(&self, path: &Path, node: &Node, reply: ReplyEntry) {
-        let ino = lock(&self.inodes).ino(path);
+        let ino = lock(&self.inodes).lookup(path);
         reply.entry(&TTL, &self.attr(ino, node), Generation(0));
     }
 
@@ -188,7 +295,7 @@ impl NszFs {
     #[expect(clippy::too_many_arguments, reason = "the fields of a setattr")]
     fn set_attr(
         &self,
-        path: &Path,
+        ino: INodeNo,
         mode: Option<u32>,
         uid: Option<u32>,
         gid: Option<u32>,
@@ -201,22 +308,26 @@ impl NszFs {
         if uid.is_some_and(|u| u != self.uid) || gid.is_some_and(|g| g != self.gid) {
             return Err(Errno::EPERM);
         }
+        // What has no open file to go through needs the name, which a
+        // deleted file does not have any more.
+        let path = self.path(ino);
+        let named = || path.as_deref().ok_or(Errno::ENOENT);
         if let Some(size) = size {
-            match fh.and_then(|fh| lock(&self.files).get(fh)) {
+            match fh.and_then(|fh| self.file(fh)) {
                 // open(O_RDONLY | O_TRUNC) reaches here as a read-only
                 // open and then a truncate through that handle, which
                 // the OS refuses: truncate by path then.
-                Some(h) => match h.set_len(size) {
-                    Err(FsError::Io(_)) => self.vfs.truncate(path, size),
-                    r => r,
+                Some(h) => match (h.set_len(size), &path) {
+                    (Err(FsError::Io(_)), Some(path)) => self.vfs.truncate(path, size),
+                    (r, _) => r,
                 },
-                None => self.vfs.truncate(path, size),
+                None => self.vfs.truncate(named()?, size),
             }
             .map_err(errno)?;
         }
         if let Some(m) = mode {
             self.vfs
-                .set_permissions(path, Permissions::from_mode(m & 0o7777))
+                .set_permissions(named()?, Permissions::from_mode(m))
                 .map_err(errno)?;
         }
         if atime.is_some() || mtime.is_some() {
@@ -225,7 +336,7 @@ impl NszFs {
                 TimeOrNow::Now => SystemTime::now(),
             };
             self.vfs
-                .set_times(path, atime.map(t), mtime.map(t))
+                .set_times(named()?, atime.map(t), mtime.map(t))
                 .map_err(errno)?;
         }
         Ok(())
@@ -243,12 +354,23 @@ impl Filesystem for NszFs {
         }
     }
 
+    fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
+        lock(&self.inodes).forget(ino, nlookup);
+    }
+
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        match self.node(ino) {
+            Ok(node) => reply.attr(&TTL, &self.attr(ino, &node)),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
         let Some(path) = self.path(ino) else {
             return reply.error(Errno::ENOENT);
         };
-        match self.vfs.lookup(&path) {
-            Ok(node) => reply.attr(&TTL, &self.attr(ino, &node)),
+        match self.vfs.read_link(&path) {
+            Ok(target) => reply.data(target.as_os_str().as_bytes()),
             Err(e) => reply.error(errno(e)),
         }
     }
@@ -265,7 +387,7 @@ impl Filesystem for NszFs {
             .and_then(|n| self.vfs.open(&path, n, write, truncate))
         {
             Ok(h) => {
-                let fh = lock(&self.files).insert(Arc::new(h));
+                let fh = lock(&self.files).insert((ino, Arc::new(h)));
                 reply.opened(fh, FopenFlags::empty());
             }
             Err(e) => reply.error(errno(e)),
@@ -283,7 +405,7 @@ impl Filesystem for NszFs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        let Some(h) = lock(&self.files).get(fh) else {
+        let Some(h) = self.file(fh) else {
             return reply.error(Errno::EBADF);
         };
         let mut buf = vec![0u8; size as usize];
@@ -291,7 +413,7 @@ impl Filesystem for NszFs {
             Ok(n) => reply.data(&buf[..n]),
             Err(e) => {
                 let path = self.path(ino).unwrap_or_default();
-                eprintln!("{}: read {size}@{offset}: {e}", path.display());
+                vfs::log_read_error(&path, size as usize, offset, &e);
                 reply.error(Errno::EIO);
             }
         }
@@ -322,18 +444,14 @@ impl Filesystem for NszFs {
             Err(e) => return reply.error(errno(e)),
         };
         let mut inodes = lock(&self.inodes);
-        let parent = path.parent().map_or(ino, |p| inodes.ino(p));
+        let parent = path.parent().map_or(ino, |p| inodes.list(p));
         let mut list = vec![
             (ino, FileType::Directory, ".".into()),
             (parent, FileType::Directory, "..".into()),
         ];
         for e in entries {
-            let kind = if e.node.as_ref().is_some_and(Node::is_dir) {
-                FileType::Directory
-            } else {
-                FileType::RegularFile
-            };
-            list.push((inodes.ino(&path.join(&e.name)), kind, e.name));
+            let kind = e.node.as_ref().map_or(FileType::RegularFile, kind);
+            list.push((inodes.list(&path.join(&e.name)), kind, e.name));
         }
         drop(inodes);
         let fh = lock(&self.dirs).insert(Arc::new(list));
@@ -368,7 +486,14 @@ impl Filesystem for NszFs {
         _flags: OpenFlags,
         reply: ReplyEmpty,
     ) {
-        lock(&self.dirs).remove(fh);
+        // What the listing showed and the kernel did not look up goes
+        // again, so the table does not keep every path ever listed.
+        if let Some(list) = lock(&self.dirs).remove(fh) {
+            let mut inodes = lock(&self.inodes);
+            for (ino, ..) in list.iter() {
+                inodes.forget(*ino, 0);
+            }
+        }
         reply.ok();
     }
 
@@ -417,11 +542,8 @@ impl Filesystem for NszFs {
         _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        let Some(path) = self.path(ino) else {
-            return reply.error(Errno::ENOENT);
-        };
-        let r = self.set_attr(&path, mode, uid, gid, size, atime, mtime, fh);
-        match r.and_then(|()| self.vfs.lookup(&path).map_err(errno)) {
+        let r = self.set_attr(ino, mode, uid, gid, size, atime, mtime, fh);
+        match r.and_then(|()| self.node(ino)) {
             Ok(node) => reply.attr(&TTL, &self.attr(ino, &node)),
             Err(e) => reply.error(e),
         }
@@ -440,10 +562,10 @@ impl Filesystem for NszFs {
         let Some(path) = self.child(parent, name) else {
             return reply.error(Errno::ENOENT);
         };
-        match self.vfs.create(&path, mode & 0o7777) {
+        match self.vfs.create(&path, mode) {
             Ok((node, h)) => {
-                let ino = lock(&self.inodes).ino(&path);
-                let fh = lock(&self.files).insert(Arc::new(h));
+                let ino = lock(&self.inodes).lookup(&path);
+                let fh = lock(&self.files).insert((ino, Arc::new(h)));
                 let attr = self.attr(ino, &node);
                 reply.created(&TTL, &attr, Generation(0), fh, FopenFlags::empty());
             }
@@ -463,7 +585,7 @@ impl Filesystem for NszFs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        let Some(h) = lock(&self.files).get(fh) else {
+        let Some(h) = self.file(fh) else {
             return reply.error(Errno::EBADF);
         };
         match h.write(offset, data) {
@@ -481,7 +603,7 @@ impl Filesystem for NszFs {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        let Some(h) = lock(&self.files).get(fh) else {
+        let Some(h) = self.file(fh) else {
             return reply.error(Errno::EBADF);
         };
         match h.sync() {
@@ -502,7 +624,7 @@ impl Filesystem for NszFs {
         let Some(path) = self.child(parent, name) else {
             return reply.error(Errno::ENOENT);
         };
-        match self.vfs.mkdir(&path, mode & 0o7777) {
+        match self.vfs.mkdir(&path, mode) {
             Ok(node) => self.reply_entry(&path, &node, reply),
             Err(e) => reply.error(errno(e)),
         }
@@ -576,7 +698,8 @@ impl Filesystem for NszFs {
 }
 
 /// Mount options from the `-o a,b` arguments given after the mountpoint,
-/// on top of `ro,fsname=fuse-nsz,default_permissions` (`rw` replaces `ro`).
+/// on top of `ro,nosuid,nodev,fsname=fuse-nsz,default_permissions` (`rw`
+/// replaces `ro`).
 /// Every request runs with the rights of the mounting user, so without
 /// `default_permissions` an `allow_other` mount would let any local user
 /// read, and in `rw` mode change, what only that user may touch.
@@ -586,6 +709,8 @@ fn config(args: &[String]) -> Result<(Config, Options), String> {
     cfg.mount_options = vec![
         MountOption::FSName("fuse-nsz".into()),
         MountOption::DefaultPermissions,
+        MountOption::NoSuid,
+        MountOption::NoDev,
     ];
     // fuser runs more than one worker thread only on Linux.
     #[cfg(target_os = "linux")]
@@ -600,7 +725,19 @@ fn config(args: &[String]) -> Result<(Config, Options), String> {
             "allow_other" => cfg.acl = SessionACL::All,
             "allow_root" => cfg.acl = SessionACL::RootAndOwner,
             "auto_unmount" => cfg.mount_options.push(MountOption::AutoUnmount),
-            "default_permissions" => {}
+            // Always in force.
+            "default_permissions" | "nosuid" | "nodev" => {}
+            "suid" | "dev" => return Err(format!("option {o} is not supported")),
+            // Flags of the mount, not parameters of the fuse driver: handed
+            // on as text, a mount by root, which does not go through
+            // fusermount3, would be refused by the kernel.
+            "exec" => cfg.mount_options.push(MountOption::Exec),
+            "noexec" => cfg.mount_options.push(MountOption::NoExec),
+            "atime" => cfg.mount_options.push(MountOption::Atime),
+            "noatime" => cfg.mount_options.push(MountOption::NoAtime),
+            "sync" => cfg.mount_options.push(MountOption::Sync),
+            "async" => cfg.mount_options.push(MountOption::Async),
+            "dirsync" => cfg.mount_options.push(MountOption::DirSync),
             o => match o.split_once('=') {
                 Some(("fsname", v)) => {
                     cfg.mount_options
@@ -660,6 +797,15 @@ fn start(fs: NszFs, mountpoint: &Path, cfg: Config) -> io::Result<(Session<NszFs
             MountOption::AutoUnmount => "auto_unmount".into(),
             MountOption::RO => "ro".into(),
             MountOption::RW => "rw".into(),
+            MountOption::NoSuid => "nosuid".into(),
+            MountOption::NoDev => "nodev".into(),
+            MountOption::Exec => "exec".into(),
+            MountOption::NoExec => "noexec".into(),
+            MountOption::Atime => "atime".into(),
+            MountOption::NoAtime => "noatime".into(),
+            MountOption::Sync => "sync".into(),
+            MountOption::Async => "async".into(),
+            MountOption::DirSync => "dirsync".into(),
             _ => return Err(invalid()),
         });
     }
@@ -686,9 +832,6 @@ fn start(fs: NszFs, mountpoint: &Path, cfg: Config) -> io::Result<(Session<NszFs
     if ch.is_null() {
         return Err(io::Error::other("macFUSE mount failed"));
     }
-    // SAFETY: `ch` is a live channel. It is never destroyed, so its
-    // descriptor is owned here alone.
-    let fd = unsafe { OwnedFd::from_raw_fd(fuse_chan_fd(ch)) };
     let mut unmount: Unmount = Box::new(move || {
         // SAFETY: `mp` is a valid C string.
         if unsafe { libc::unmount(mp.as_ptr(), 0) } == 0 {
@@ -697,6 +840,15 @@ fn start(fs: NszFs, mountpoint: &Path, cfg: Config) -> io::Result<(Session<NszFs
             Err(io::Error::last_os_error())
         }
     });
+    // SAFETY: `ch` is a live channel.
+    let raw = unsafe { fuse_chan_fd(ch) };
+    if raw < 0 {
+        let _ = unmount();
+        return Err(io::Error::other("macFUSE gave no channel descriptor"));
+    }
+    // SAFETY: the channel is never destroyed, so its descriptor is owned
+    // here alone.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
     let acl = cfg.acl;
     match Session::from_fd(fs, fd, acl, cfg) {
         Ok(session) => Ok((session, unmount)),
@@ -707,10 +859,11 @@ fn start(fs: NszFs, mountpoint: &Path, cfg: Config) -> io::Result<(Session<NszFs
     }
 }
 
-/// Every cached image keeps its source file open, so a directory with many
-/// containers needs more descriptors than the default soft limit (1024 on
-/// Linux, 256 on macOS). Raise it to the hard limit. macOS refuses a soft
-/// limit above its per process maximum, so fall back to its usual value.
+/// Every file a client has open is one descriptor here, on top of the
+/// cached images and of the ones a listing is building. The default soft
+/// limit (1024 on Linux, 256 on macOS) is low for a file server, so raise
+/// it to the hard limit. macOS refuses a soft limit above its per process
+/// maximum, so fall back to its usual value.
 fn raise_nofile_limit() {
     let mut rl = libc::rlimit {
         rlim_cur: 0,
@@ -735,36 +888,69 @@ fn raise_nofile_limit() {
     }
 }
 
+/// Unmount `mountpoint` although it is in use. On Linux it leaves the tree
+/// at once and the session ends with its last user. On macOS open files are
+/// cut off.
+fn detach(mountpoint: &Path) -> io::Result<()> {
+    let mp = vfs::c_path(mountpoint)?;
+    // SAFETY: `mp` is a valid C string.
+    #[cfg(target_os = "linux")]
+    let r = unsafe { libc::umount2(mp.as_ptr(), libc::MNT_DETACH) };
+    // SAFETY: `mp` is a valid C string.
+    #[cfg(target_os = "macos")]
+    let r = unsafe { libc::unmount(mp.as_ptr(), libc::MNT_FORCE) };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let r = {
+        let _ = mp;
+        return Err(io::ErrorKind::Unsupported.into());
+    };
+    if r != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Mount `src` on `mountpoint` and serve it until it is unmounted, or
-/// until SIGINT, SIGTERM or SIGHUP, which unmount it.
+/// until SIGINT, SIGTERM or SIGHUP, which unmount it. A second signal ends
+/// the process without waiting for a mount that is still in use.
 pub fn mount(src: PathBuf, mountpoint: &Path, args: &[String]) -> Result<(), String> {
     let (cfg, opts) = config(args)?;
     raise_nofile_limit();
-    let mut inodes = Inodes::default();
-    inodes.ino(Path::new(""));
+    // The mode of a create or mkdir comes with the umask of its caller
+    // applied by the kernel. The one of this process must not come on top.
+    // SAFETY: umask has no preconditions and cannot fail.
+    unsafe { libc::umask(0) };
     let fs = NszFs {
         vfs: Vfs::new(src, opts),
-        inodes: Mutex::new(inodes),
+        inodes: Mutex::new(Inodes::new()),
         files: Mutex::new(Handles::new()),
         dirs: Mutex::new(Handles::new()),
         // SAFETY: getuid and getgid have no preconditions and cannot fail.
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
     };
-    let (session, mut unmount) =
-        start(fs, mountpoint, cfg).map_err(|e| format!("{}: {e}", mountpoint.display()))?;
+    // Before the mount: a failure here must not leave one behind.
     let mut signals = signal_hook::iterator::Signals::new([
         signal_hook::consts::SIGINT,
         signal_hook::consts::SIGTERM,
         signal_hook::consts::SIGHUP,
     ])
     .map_err(|e| e.to_string())?;
+    let (session, mut unmount) =
+        start(fs, mountpoint, cfg).map_err(|e| format!("{}: {e}", mountpoint.display()))?;
+    let mountpoint = mountpoint.to_path_buf();
     std::thread::spawn(move || {
-        if signals.forever().next().is_some()
-            && let Err(e) = unmount()
-        {
-            eprintln!("unmount: {e}");
+        let mut signals = signals.forever();
+        signals.next();
+        // Root gets "busy" for a mount that is in use, where another user
+        // is handed on to fusermount3, which detaches it.
+        if let Err(e) = unmount().or_else(|e| detach(&mountpoint).map_err(|_| e)) {
+            log!("unmount: {e}");
         }
+        // The session ends with the unmount, or with the last user of a
+        // detached mount. A second signal does not wait for that.
+        signals.next();
+        std::process::exit(1);
     });
     session.run().map_err(|e| e.to_string())
 }
@@ -775,9 +961,9 @@ mod tests {
 
     #[test]
     fn inodes_subtree() {
-        let mut t = Inodes::default();
-        let names = ["", "a", "a b", "a.x", "a/b", "a/b/c", "ab", "z"];
-        let ino: Vec<u64> = names.iter().map(|n| t.ino(Path::new(n)).0).collect();
+        let mut t = Inodes::new();
+        let names = ["a", "a b", "a.x", "a/b", "a/b/c", "ab", "z"];
+        let ino: Vec<INodeNo> = names.iter().map(|n| t.lookup(Path::new(n))).collect();
         let live = |t: &Inodes| -> Vec<String> {
             t.by_path
                 .keys()
@@ -787,16 +973,109 @@ mod tests {
 
         t.rename(Path::new("a"), Path::new("y"));
         assert_eq!(live(&t), ["", "a b", "a.x", "ab", "y", "y/b", "y/b/c", "z"]);
-        assert_eq!(t.ino(Path::new("y/b/c")).0, ino[5]);
-        assert_eq!(t.paths[ino[4] as usize - 1], Path::new("y/b"));
+        assert_eq!(t.list(Path::new("y/b/c")), ino[4]);
+        assert_eq!(t.path(ino[3]), Some(Path::new("y/b")));
 
-        // Replacing a target forgets it and everything under it.
-        t.ino(Path::new("z/old"));
+        // Replacing a target takes its name and those under it away.
+        let old = t.lookup(Path::new("z/old"));
         t.rename(Path::new("y"), Path::new("z"));
         assert_eq!(live(&t), ["", "a b", "a.x", "ab", "z", "z/b", "z/b/c"]);
-        assert_eq!(t.ino(Path::new("z")).0, ino[1]);
+        assert_eq!(t.list(Path::new("z")), ino[0]);
+        assert_eq!(t.path(old), None);
+        assert_eq!(t.path(ino[6]), None);
 
         t.remove(Path::new("z"));
         assert_eq!(live(&t), ["", "a b", "a.x", "ab"]);
+    }
+
+    /// An inode lives as long as the kernel holds a lookup of it, also
+    /// after its name is gone, and a name that comes back is a new inode.
+    #[test]
+    fn inodes_lifetime() {
+        let mut t = Inodes::new();
+        let p = Path::new("f");
+        let known = |t: &Inodes| t.by_path.get(p).map(|&i| INodeNo(i));
+        let ino = t.lookup(p);
+        assert_eq!((t.lookup(p), known(&t)), (ino, Some(ino)));
+        t.forget(ino, 1);
+        assert_eq!(t.path(ino), Some(p));
+        t.forget(ino, 1);
+        assert_eq!((t.path(ino), known(&t)), (None, None));
+        assert_eq!(t.nodes.len(), 1);
+
+        // Deleted while open: no name, and the next file of that name is
+        // another inode.
+        let old = t.lookup(p);
+        assert_ne!(old, ino);
+        t.remove(p);
+        assert_eq!((t.path(old), known(&t)), (None, None));
+        let new = t.lookup(p);
+        assert_ne!(new, old);
+        // The late forget of the old inode leaves the new one alone.
+        t.forget(old, 1);
+        assert_eq!((t.path(new), known(&t)), (Some(p), Some(new)));
+        assert_eq!(t.nodes.len(), 2);
+
+        // More forgets than lookups, an unknown inode, the root.
+        t.forget(new, 5);
+        t.forget(INodeNo(999), 1);
+        t.forget(INodeNo::ROOT, u64::MAX);
+        assert_eq!(t.path(INodeNo::ROOT), Some(Path::new("")));
+        assert_eq!((t.nodes.len(), t.by_path.len()), (1, 1));
+    }
+
+    /// A listing gives every entry its number, and keeps none of those the
+    /// kernel did not look up.
+    #[test]
+    fn inodes_listing() {
+        let mut t = Inodes::new();
+        let (a, b) = (Path::new("d/a"), Path::new("d/b"));
+        let listed = [t.list(a), t.list(b)];
+        assert_ne!(listed[0], listed[1]);
+        // The number a lookup gives is the one the listing showed.
+        assert_eq!(t.lookup(a), listed[0]);
+        // A second listing of the same directory, closed first.
+        assert_eq!([t.list(a), t.list(b)], listed);
+        for ino in listed {
+            t.forget(ino, 0);
+        }
+        assert_eq!(t.path(listed[0]), Some(a));
+        assert_eq!(t.path(listed[1]), None);
+        assert_eq!(t.nodes.len(), 2);
+        // Closing the first one finds nothing left to drop, and does not
+        // take the number b got meanwhile.
+        let again = t.lookup(b);
+        assert_ne!(again, listed[1]);
+        for ino in listed {
+            t.forget(ino, 0);
+        }
+        assert_eq!(t.path(again), Some(b));
+        t.forget(listed[0], 1);
+        t.forget(again, 1);
+        assert_eq!((t.nodes.len(), t.by_path.len()), (1, 1));
+    }
+
+    #[test]
+    fn mount_flags() {
+        let opts = |o: &str| config(&["-o".into(), o.into()]);
+        let (cfg, o) = opts("rw,noexec,nosuid,nodev,noatime,hide_sources").unwrap();
+        assert!(o.rw && o.hide_sources);
+        for want in [MountOption::NoExec, MountOption::NoAtime, MountOption::RW] {
+            assert!(cfg.mount_options.contains(&want), "{want:?}");
+        }
+        // Nothing is left for the kernel to take as a fuse parameter.
+        assert!(
+            !cfg.mount_options
+                .iter()
+                .any(|m| matches!(m, MountOption::CUSTOM(_)))
+        );
+        for o in ["suid", "dev"] {
+            assert!(opts(o).is_err(), "{o}");
+        }
+        let (cfg, _) = opts("max_read=4096").unwrap();
+        assert!(
+            cfg.mount_options
+                .contains(&MountOption::CUSTOM("max_read=4096".into()))
+        );
     }
 }

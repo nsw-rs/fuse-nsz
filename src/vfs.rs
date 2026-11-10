@@ -6,11 +6,16 @@
 //! compressed `.nsz`/`.xcz` also shows up as a virtual `.nsp`/`.xci`.
 //! Paths are relative to the mirrored directory. Read-only unless mounted
 //! with `rw`.
+//!
+//! A symlink in the mirrored directory is an entry of its own: it is shown
+//! as a link, and reading, changing or deleting it never touches its
+//! target. Following it is left to the caller. The one thing served through
+//! a link is the virtual image of a container it points to.
 
 use libhac::image::{self, Image, Shared};
 use libhac::{Error, ReadAt, SubStorage};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata};
 use std::io;
@@ -20,6 +25,29 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
+
+/// Print a line to stderr. Unlike `eprintln!` it does not panic when stderr
+/// cannot be written (a closed pipe, a full disk): a panic would end the
+/// thread that serves the request.
+macro_rules! log {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+pub(crate) use log;
+
+/// Log a failed read, at most one line a second: a client that keeps
+/// reading a broken file must not fill the log. The other errors of that
+/// second are dropped.
+pub fn log_read_error(path: &Path, len: usize, off: u64, e: &io::Error) {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let mut last = lock(&LAST);
+    if last.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
+        *last = Some(Instant::now());
+        log!("{}: read {len}@{off}: {e}", path.display());
+    }
+}
 
 /// Mount options shared by the backends.
 #[derive(Clone, Copy, Debug, Default)]
@@ -93,21 +121,27 @@ pub type Result<T> = std::result::Result<T, FsError>;
 /// A file or directory as seen through the mount.
 #[derive(Clone)]
 pub struct Node {
-    /// Metadata of the real file, or of the source container for a
-    /// virtual image.
+    /// Metadata of the real entry itself, a symlink not followed, or of
+    /// the source container for a virtual image.
     pub meta: Metadata,
-    pub image: Option<Arc<Image>>,
+    /// Size of the virtual image, for one.
+    pub image_len: Option<u64>,
 }
 
 impl Node {
+    /// A virtual image, not an entry of the mirrored directory.
+    pub fn is_image(&self) -> bool {
+        self.image_len.is_some()
+    }
+
     pub fn is_dir(&self) -> bool {
-        self.image.is_none() && self.meta.is_dir()
+        !self.is_image() && self.meta.is_dir()
     }
 
     /// Size in bytes, 0 for a directory.
     pub fn size(&self) -> u64 {
-        match &self.image {
-            Some(img) => img.len(),
+        match self.image_len {
+            Some(len) => len,
             None if self.meta.is_dir() => 0,
             None => self.meta.len(),
         }
@@ -121,7 +155,7 @@ impl Node {
 /// A directory entry.
 pub struct DirEntry {
     pub name: OsString,
-    /// `None` when the entry cannot be resolved, e.g. a dangling symlink.
+    /// `None` when the entry cannot be read, e.g. it is gone again.
     pub node: Option<Node>,
 }
 
@@ -319,7 +353,8 @@ fn verbatim(path: &Path) -> Vec<u16> {
 
 /// Set the times of the file or directory at `path`, `None` keeping one
 /// as is. The file is not opened, so its owner can touch it even without
-/// read permission, as on any other file system.
+/// read permission, as on any other file system. A symlink gets the times
+/// itself.
 #[cfg(unix)]
 fn set_path_times(
     path: &Path,
@@ -359,14 +394,23 @@ fn set_path_times(
     let times = [ts(atime)?, ts(mtime)?];
     let path = c_path(path)?;
     // SAFETY: `path` is a valid C string and `times` holds two timespecs.
-    if unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) } != 0 {
+    let r = unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if r != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
 }
 
 /// Set the times of the file or directory at `path`, `None` keeping one
-/// as is. It is opened with write attributes access only.
+/// as is. It is opened with write attributes access only. A symlink gets
+/// the times itself.
 #[cfg(windows)]
 fn set_path_times(
     path: &Path,
@@ -377,6 +421,8 @@ fn set_path_times(
     const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
     // Needed to open a directory.
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    // The link, not its target.
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     let mut times = fs::FileTimes::new();
     if let Some(t) = atime {
         times = times.set_accessed(t);
@@ -386,7 +432,7 @@ fn set_path_times(
     }
     fs::OpenOptions::new()
         .access_mode(FILE_WRITE_ATTRIBUTES)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?
         .set_times(times)
 }
@@ -412,24 +458,88 @@ fn read_file_at(f: &File, mut off: u64, buf: &mut [u8]) -> io::Result<usize> {
     Ok(done)
 }
 
-/// The virtual image of one source container, rebuilt when its size or
-/// mtime changes.
-struct Container {
-    /// Real path the container was first reached by.
-    path: PathBuf,
+/// What tells one version of a source file from the next.
+#[derive(PartialEq)]
+struct Stamp {
     size: u64,
     mtime: Option<SystemTime>,
-    /// `None`: no virtual file (solid NCZ or parse error).
-    image: OnceLock<Option<Arc<Image>>>,
+    /// Seconds and nanoseconds. Unlike the mtime it cannot be set back, so
+    /// it also shows a file that was replaced and given its old mtime.
+    #[cfg(unix)]
+    ctime: (i64, i64),
+}
+
+impl Stamp {
+    fn of(meta: &Metadata) -> Self {
+        Stamp {
+            size: meta.len(),
+            mtime: meta.modified().ok(),
+            #[cfg(unix)]
+            ctime: {
+                use std::os::unix::fs::MetadataExt;
+                (meta.ctime(), meta.ctime_nsec())
+            },
+        }
+    }
+}
+
+/// One source container and the size of its virtual image. A new one takes
+/// its place when the source changes, see [`Stamp`].
+struct Container {
+    key: Key,
+    /// Real path the container was first reached by.
+    path: PathBuf,
+    stamp: Stamp,
+    /// Size of the image, set by the first build. `None`: no virtual file
+    /// (solid NCZ or parse error).
+    len: OnceLock<Option<u64>>,
     /// Set when the build failed with an error that may go away by
     /// itself: the build is retried after this instant.
     retry_at: OnceLock<Instant>,
+}
+
+/// The containers seen so far, and the few images that are kept built.
+#[derive(Default)]
+struct Cache {
+    containers: HashMap<Key, Arc<Container>>,
+    /// Least recently used first, at most [`MAX_IMAGES`].
+    images: VecDeque<(Arc<Container>, Arc<Image>)>,
+}
+
+impl Cache {
+    /// Whether `c` is still the container cached for its source.
+    fn current(&self, c: &Arc<Container>) -> bool {
+        self.containers
+            .get(&c.key)
+            .is_some_and(|x| Arc::ptr_eq(x, c))
+    }
+
+    /// Let go of the images whose container is not cached any more, so
+    /// their source files get closed once no open handle references them.
+    fn prune(&mut self) {
+        let containers = &self.containers;
+        self.images
+            .retain(|(c, _)| containers.get(&c.key).is_some_and(|x| Arc::ptr_eq(x, c)));
+    }
 }
 
 /// How long a container whose build failed with a transient error stays
 /// hidden before the next attempt, so it is not reopened and logged on
 /// every lookup.
 const RETRY: Duration = Duration::from_secs(30);
+
+/// How long the virtual file that takes the place of a deleted or renamed
+/// real file cannot be deleted or renamed itself. The name stays in the
+/// listing, so whoever deletes it again, as if the first delete had failed,
+/// would lose the source container too.
+const UNSHADOW: Duration = Duration::from_secs(60);
+
+/// Most images kept built at once. Each one holds its source file open and
+/// the tables of its container in memory, so without a limit a large library
+/// runs into the limit of open files. A listing only needs the sizes, which
+/// stay cached; an image that was let go is built again when it is opened.
+/// An open file keeps its image whatever this limit says.
+const MAX_IMAGES: usize = 64;
 
 /// Most threads building the images of one directory listing at once. The
 /// builds wait on the source's I/O (a NAS round trip per header read), not
@@ -478,7 +588,11 @@ fn fold(path: &Path) -> Cow<'_, Path> {
 pub struct Vfs {
     root: PathBuf,
     opts: Options,
-    containers: Mutex<HashMap<Key, Arc<Container>>>,
+    cache: Mutex<Cache>,
+    /// Real files with a virtual name deleted or renamed away through the
+    /// mount, by path as
+    /// [`fold`] gives it, with the time: see [`UNSHADOW`].
+    unshadowed: Mutex<HashMap<PathBuf, Instant>>,
 }
 
 /// Virtual names only differ from the source in the last extension byte,
@@ -522,9 +636,24 @@ fn transient(e: &Error) -> bool {
     matches!(e, Error::Io(io) if io.kind() != io::ErrorKind::UnexpectedEof)
 }
 
-fn build_container(path: &Path, size: u64) -> libhac::Result<Image> {
+/// Metadata of the file a container at `path` is read from, `meta` being
+/// that of `path` itself: a regular file, or a symlink to one.
+fn container_meta(path: &Path, meta: &Metadata) -> Option<Metadata> {
+    if meta.is_symlink() {
+        fs::metadata(path).ok().filter(Metadata::is_file)
+    } else {
+        meta.is_file().then(|| meta.clone())
+    }
+}
+
+/// The image of the container at `path`. Fails when the file opened is not
+/// the version `stamp` was taken from.
+fn build_container(path: &Path, stamp: &Stamp) -> libhac::Result<Image> {
     let file = File::open(path)?;
-    let src: Shared = Arc::new(SubStorage::new(file, 0, size)?);
+    if Stamp::of(&file.metadata()?) != *stamp {
+        return Err(io::Error::other("changed while it was opened").into());
+    }
+    let src: Shared = Arc::new(SubStorage::new(file, 0, stamp.size)?);
     // The source file stays open as long as the image (or an open handle)
     // references it.
     image::build(src)
@@ -541,7 +670,8 @@ impl Vfs {
         Vfs {
             root,
             opts,
-            containers: Mutex::new(HashMap::new()),
+            cache: Mutex::new(Cache::default()),
+            unshadowed: Mutex::new(HashMap::new()),
         }
     }
 
@@ -555,8 +685,8 @@ impl Vfs {
         self.opts.rw
     }
 
-    fn containers(&self) -> MutexGuard<'_, HashMap<Key, Arc<Container>>> {
-        lock(&self.containers)
+    fn cache(&self) -> MutexGuard<'_, Cache> {
+        lock(&self.cache)
     }
 
     /// `rel` under the root. Only plain names are accepted: `..`, a root
@@ -568,56 +698,120 @@ impl Vfs {
         Ok(self.root.join(rel))
     }
 
-    /// The virtual image of the source container at `path`, if it has one.
-    fn image(&self, path: &Path, meta: &Metadata) -> Option<Arc<Image>> {
-        let (size, mtime) = (meta.len(), meta.modified().ok());
-        let fresh = || {
-            Arc::new(Container {
-                path: path.to_path_buf(),
-                size,
-                mtime,
-                image: OnceLock::new(),
-                retry_at: OnceLock::new(),
-            })
+    /// The cached container of the source at `path`, a new one when the
+    /// source changed or a failed build is due again.
+    fn container(&self, path: &Path, meta: &Metadata) -> Arc<Container> {
+        let (key, stamp) = (key(path, meta), Stamp::of(meta));
+        let mut cache = self.cache();
+        if let Some(c) = cache.containers.get(&key)
+            && c.stamp == stamp
+            && !c.retry_at.get().is_some_and(|&t| Instant::now() >= t)
+        {
+            return Arc::clone(c);
+        }
+        let c = Arc::new(Container {
+            key: self::key(path, meta),
+            path: path.to_path_buf(),
+            stamp,
+            len: OnceLock::new(),
+            retry_at: OnceLock::new(),
+        });
+        cache.containers.insert(key, Arc::clone(&c));
+        cache.prune();
+        c
+    }
+
+    /// Cache `image` as the most recently used one of `c`.
+    fn keep(&self, c: &Arc<Container>, image: Arc<Image>) {
+        let mut cache = self.cache();
+        // Replaced or forgotten meanwhile: the source must not stay open.
+        if !cache.current(c) {
+            return;
+        }
+        cache.images.retain(|(x, _)| !Arc::ptr_eq(x, c));
+        cache.images.push_back((Arc::clone(c), image));
+        let evicted = if cache.images.len() > MAX_IMAGES {
+            cache.images.pop_front()
+        } else {
+            None
         };
-        let c = {
-            let mut cs = self.containers();
-            let c = cs.entry(key(path, meta)).or_insert_with(&fresh);
-            if c.size != size
-                || c.mtime != mtime
-                || c.retry_at.get().is_some_and(|&t| Instant::now() >= t)
-            {
-                *c = fresh();
-            }
-            Arc::clone(c)
-        };
+        // Closing the source of the image let go of can take a round trip
+        // to a NAS: not while other lookups wait for the lock.
+        drop(cache);
+        drop(evicted);
+    }
+
+    /// The size of the virtual image of the source container at `path`, if
+    /// it has one. The first call builds the image.
+    fn image_len(&self, path: &Path, meta: &Metadata) -> Option<u64> {
+        let c = self.container(path, meta);
+        self.len_of(&c)
+    }
+
+    fn len_of(&self, c: &Arc<Container>) -> Option<u64> {
         // Built outside the lock, so a slow source does not stall other
         // lookups.
-        c.image
-            .get_or_init(|| match build_container(path, size) {
-                Ok(img) => Some(Arc::new(img)),
+        *c.len
+            .get_or_init(|| match build_container(&c.path, &c.stamp) {
+                Ok(img) => {
+                    let len = img.len();
+                    self.keep(c, Arc::new(img));
+                    Some(len)
+                }
                 Err(e) => {
                     let note = if matches!(e, Error::Unsupported(_)) {
                         ", not exposed"
                     } else {
                         ""
                     };
-                    eprintln!("{}: {e}{note}", path.display());
+                    log!("{}: {e}{note}", c.path.display());
                     if transient(&e) {
                         let _ = c.retry_at.set(Instant::now() + RETRY);
                     }
                     None
                 }
             })
-            .clone()
     }
 
-    /// [`Vfs::image`] of every job, in order. The builds run on up to
+    /// The virtual image of the source container at `path`, built again
+    /// when the cache let go of it.
+    fn image(&self, path: &Path, meta: &Metadata) -> Option<Arc<Image>> {
+        let c = self.container(path, meta);
+        let len = self.len_of(&c)?;
+        let held = self
+            .cache()
+            .images
+            .iter()
+            .find(|(x, _)| Arc::ptr_eq(x, &c))
+            .map(|(_, img)| Arc::clone(img));
+        let image = match held {
+            Some(img) => img,
+            None => match build_container(&c.path, &c.stamp) {
+                Ok(img) if img.len() == len => Arc::new(img),
+                // Not what the first build saw: the next lookup starts
+                // over with a new container.
+                r => {
+                    if let Err(e) = r {
+                        log!("{}: {e}", c.path.display());
+                    }
+                    let mut cache = self.cache();
+                    if cache.current(&c) {
+                        cache.containers.remove(&c.key);
+                    }
+                    return None;
+                }
+            },
+        };
+        self.keep(&c, Arc::clone(&image));
+        Some(image)
+    }
+
+    /// [`Vfs::image_len`] of every job, in order. The builds run on up to
     /// [`BUILD_THREADS`] threads, the calling one included. A thread that
     /// cannot be spawned only means fewer of them.
-    fn images(&self, jobs: &[(PathBuf, &Metadata)]) -> Vec<Option<Arc<Image>>> {
+    fn image_lens(&self, jobs: &[(PathBuf, &Metadata)]) -> Vec<Option<u64>> {
         if jobs.len() <= 1 {
-            return jobs.iter().map(|(p, m)| self.image(p, m)).collect();
+            return jobs.iter().map(|(p, m)| self.image_len(p, m)).collect();
         }
         let next = AtomicUsize::new(0);
         let work = || {
@@ -627,7 +821,7 @@ impl Vfs {
                 let Some((p, m)) = jobs.get(i) else {
                     return done;
                 };
-                done.push((i, self.image(p, m)));
+                done.push((i, self.image_len(p, m)));
             }
         };
         let mut out = vec![None; jobs.len()];
@@ -639,8 +833,8 @@ impl Vfs {
             for w in workers {
                 done.extend(w.join().unwrap_or_else(|e| panic::resume_unwind(e)));
             }
-            for (i, img) in done {
-                out[i] = img;
+            for (i, len) in done {
+                out[i] = len;
             }
         });
         out
@@ -651,39 +845,54 @@ impl Vfs {
     /// WinFsp may pass a name in another case than the one cached.
     fn forget(&self, path: &Path) {
         let path = fold(path);
-        self.containers()
+        let mut cache = self.cache();
+        cache
+            .containers
             .retain(|_, c| !fold(&c.path).starts_with(&path));
+        cache.prune();
     }
 
     /// Whether the real file `path` is a source container hidden by
     /// `hide_sources`: its virtual file is shown in its place.
     fn hidden(&self, path: &Path, meta: &Metadata) -> bool {
         self.opts.hide_sources
-            && meta.is_file()
             && path.file_name().and_then(virtual_name).is_some_and(|vn| {
-                matches!(fs::metadata(path.with_file_name(vn)),
+                matches!(fs::symlink_metadata(path.with_file_name(vn)),
                     Err(e) if e.kind() == io::ErrorKind::NotFound)
-                    && self.image(path, meta).is_some()
+                    && container_meta(path, meta)
+                        .is_some_and(|m| self.image_len(path, &m).is_some())
             })
     }
 
     /// Resolve `rel` to a real file or a virtual image.
     pub fn lookup(&self, rel: &Path) -> Result<Node> {
         let rp = self.real(rel)?;
-        match fs::metadata(&rp) {
+        // The root is the user's choice and may be a link.
+        let meta = if rel.as_os_str().is_empty() {
+            fs::metadata(&rp)
+        } else {
+            fs::symlink_metadata(&rp)
+        };
+        match meta {
             Ok(meta) if self.hidden(&rp, &meta) => return Err(FsError::NotFound),
-            Ok(meta) => return Ok(Node { meta, image: None }),
+            Ok(meta) => {
+                return Ok(Node {
+                    meta,
+                    image_len: None,
+                });
+            }
             Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
             Err(_) => {}
         }
         if let Some(src) = rp.file_name().and_then(source_name) {
             let src = rp.with_file_name(src);
+            // Followed: a link to a container is a source too.
             match fs::metadata(&src) {
                 Ok(meta) if meta.is_file() => {
-                    if let Some(image) = self.image(&src, &meta) {
+                    if let Some(len) = self.image_len(&src, &meta) {
                         return Ok(Node {
                             meta,
-                            image: Some(image),
+                            image_len: Some(len),
                         });
                     }
                 }
@@ -716,57 +925,57 @@ impl Vfs {
                 || vn
                     .to_str()
                     .is_some_and(|s| folded.contains(&s.to_lowercase()))
-                    && fs::metadata(dir.join(vn)).is_ok()
+                    && fs::symlink_metadata(dir.join(vn)).is_ok()
         };
         let mut seen = HashSet::new();
         // Each name with its metadata and, when an image must be built for
-        // it, its virtual name.
+        // it, its virtual name and the metadata of the container.
         let entries: Vec<_> = names
             .iter()
             .map(|name| {
                 let path = dir.join(name);
-                let meta = fs::metadata(&path).ok();
-                let vn = match (&meta, virtual_name(name)) {
-                    (Some(m), Some(vn)) if m.is_file() => {
-                        seen.insert(key(&path, m));
-                        (!shadowed(&vn)).then_some(vn)
-                    }
-                    _ => None,
-                };
-                (name, meta, vn)
+                let meta = fs::symlink_metadata(&path).ok();
+                let virt = meta.as_ref().zip(virtual_name(name)).and_then(|(m, vn)| {
+                    let cm = container_meta(&path, m)?;
+                    seen.insert(key(&path, &cm));
+                    (!shadowed(&vn)).then_some((vn, cm))
+                });
+                (name, meta, virt)
             })
             .collect();
         let jobs: Vec<(PathBuf, &Metadata)> = entries
             .iter()
-            .filter_map(|(name, meta, vn)| {
-                vn.as_ref()?;
-                Some((dir.join(name), meta.as_ref()?))
-            })
+            .filter_map(|(name, _, virt)| Some((dir.join(name), &virt.as_ref()?.1)))
             .collect();
-        let mut images = self.images(&jobs).into_iter();
+        let mut lens = self.image_lens(&jobs).into_iter();
         let mut out = Vec::with_capacity(names.len());
-        for (name, meta, vn) in entries {
-            let virt = match (vn, &meta) {
-                (Some(vn), Some(m)) => images.next().flatten().map(|image| DirEntry {
+        for (name, meta, virt) in entries {
+            let virt = virt.and_then(|(vn, cm)| {
+                lens.next().flatten().map(|len| DirEntry {
                     name: vn,
                     node: Some(Node {
-                        meta: m.clone(),
-                        image: Some(image),
+                        meta: cm,
+                        image_len: Some(len),
                     }),
-                }),
-                _ => None,
-            };
+                })
+            });
             if !(self.opts.hide_sources && virt.is_some()) {
                 out.push(DirEntry {
                     name: name.clone(),
-                    node: meta.map(|meta| Node { meta, image: None }),
+                    node: meta.map(|meta| Node {
+                        meta,
+                        image_len: None,
+                    }),
                 });
             }
             out.extend(virt);
         }
         // Source deleted: let its file be closed.
-        self.containers()
+        let mut cache = self.cache();
+        cache
+            .containers
             .retain(|k, c| c.path.parent() != Some(&dir) || seen.contains(k));
+        cache.prune();
         Ok(out)
     }
 
@@ -779,11 +988,15 @@ impl Vfs {
         if write {
             self.writable()?;
         }
-        if let Some(img) = node.image {
+        if node.is_image() {
             if write {
                 return Err(FsError::Denied);
             }
-            return Ok(Handle::Image(img));
+            let src = source_path(&self.real(rel)?).ok_or(FsError::NotFound)?;
+            return match self.image(&src, &node.meta) {
+                Some(img) => Ok(Handle::Image(img)),
+                None => Err(FsError::NotFound),
+            };
         }
         if node.meta.is_dir() {
             return Err(FsError::IsDir);
@@ -794,10 +1007,14 @@ impl Vfs {
         }
         let mut opts = fs::OpenOptions::new();
         opts.read(true).write(write).truncate(truncate);
-        // The node may have been swapped for a FIFO since the lookup: do not
-        // wait for a writer. No effect on reads of a regular file.
+        // The node may have been swapped for a FIFO or a symlink since the
+        // lookup: do not wait for a writer, do not follow the link. No
+        // effect on a regular file.
         #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::custom_flags(&mut opts, libc::O_NONBLOCK);
+        std::os::unix::fs::OpenOptionsExt::custom_flags(
+            &mut opts,
+            libc::O_NONBLOCK | libc::O_NOFOLLOW,
+        );
         let file = opts.open(self.real(rel)?)?;
         if !file.metadata()?.is_file() {
             return Err(FsError::Access);
@@ -819,7 +1036,7 @@ impl Vfs {
         self.writable()?;
         let node = self.lookup(rel)?;
         let rp = self.real(rel)?;
-        if node.image.is_none() {
+        if !node.is_image() {
             return Ok((node, rp));
         }
         let src = source_path(&rp).ok_or(FsError::NotFound)?;
@@ -827,7 +1044,9 @@ impl Vfs {
     }
 
     /// Create the regular file `rel` and open it for reading and writing.
-    /// `mode` gives its permissions on Unix.
+    /// `mode` gives its permissions on Unix, where only the permission bits
+    /// are taken: no set-user-ID or set-group-ID file is made through the
+    /// mount.
     pub fn create(&self, rel: &Path, mode: u32) -> Result<(Node, Handle)> {
         self.writable()?;
         if self.lookup(rel).is_ok() {
@@ -837,15 +1056,23 @@ impl Vfs {
         // A hidden source fails here with Exists, so it is never truncated.
         opts.read(true).write(true).create_new(true);
         #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, mode);
+        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, mode & 0o777);
         #[cfg(windows)]
         let _ = mode;
         let file = opts.open(self.real(rel)?)?;
         let meta = file.metadata()?;
-        Ok((Node { meta, image: None }, Handle::File(file)))
+        Ok((
+            Node {
+                meta,
+                image_len: None,
+            },
+            Handle::File(file),
+        ))
     }
 
-    /// Create the directory `rel`. `mode` gives its permissions on Unix.
+    /// Create the directory `rel`. `mode` gives its permissions on Unix, the
+    /// permission bits only as for [`Vfs::create`]. The sticky bit comes
+    /// with a chmod: not every system takes it at mkdir.
     pub fn mkdir(&self, rel: &Path, mode: u32) -> Result<Node> {
         self.writable()?;
         if self.lookup(rel).is_ok() {
@@ -853,27 +1080,64 @@ impl Vfs {
         }
         let rp = self.real(rel)?;
         #[cfg(unix)]
-        std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), mode).create(&rp)?;
+        std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), mode & 0o777)
+            .create(&rp)?;
         #[cfg(windows)]
         {
             let _ = mode;
             fs::create_dir(&rp)?;
         }
-        let meta = fs::metadata(&rp)?;
-        Ok(Node { meta, image: None })
+        let meta = fs::symlink_metadata(&rp)?;
+        Ok(Node {
+            meta,
+            image_len: None,
+        })
+    }
+
+    /// The target of the symlink `rel`.
+    #[cfg(unix)]
+    pub fn read_link(&self, rel: &Path) -> Result<PathBuf> {
+        Ok(fs::read_link(self.real(rel)?)?)
+    }
+
+    /// Fails with [`FsError::Denied`] while the virtual file `rel` cannot
+    /// be deleted or renamed, see [`UNSHADOW`].
+    pub fn deletable(&self, rel: &Path) -> Result<()> {
+        let name = fold(&self.real(rel)?).into_owned();
+        match lock(&self.unshadowed).get(&name) {
+            Some(t) if t.elapsed() < UNSHADOW => Err(FsError::Denied),
+            _ => Ok(()),
+        }
     }
 
     /// Remove the file `rel`. A virtual image removes its source, and
-    /// returns the path of that source.
+    /// returns the path of that source. A symlink is removed itself, also
+    /// when it is the source.
     pub fn unlink(&self, rel: &Path) -> Result<Option<PathBuf>> {
         let (node, path) = self.target(rel)?;
         if node.is_dir() {
             return Err(FsError::IsDir);
         }
+        if node.is_image() {
+            self.deletable(rel)?;
+        }
         // On Windows the cached image must let go of the source first.
         self.forget(&path);
         fs::remove_file(&path)?;
-        Ok(node.image.and(source_path(rel)))
+        if !node.is_image() {
+            self.unshadow(rel, &path);
+        }
+        Ok(node.image_len.and(source_path(rel)))
+    }
+
+    /// The real file `rel` at `path` is gone: when it hid a virtual file,
+    /// that one shows up under its name and is guarded, see [`UNSHADOW`].
+    fn unshadow(&self, rel: &Path, path: &Path) {
+        if source_path(rel).is_some() {
+            let mut gone = lock(&self.unshadowed);
+            gone.retain(|_, t| t.elapsed() < UNSHADOW);
+            gone.insert(fold(path).into_owned(), Instant::now());
+        }
     }
 
     /// Remove the empty directory `rel`.
@@ -897,8 +1161,9 @@ impl Vfs {
 
     /// Rename `from` to `to`, replacing `to` unless `noreplace`. A virtual
     /// image renames its source container, so `to` must be a virtual name
-    /// too and must not exist. Replacing a virtual file or a hidden
-    /// source is refused: it would leave the source behind, or delete it.
+    /// with the same extension and must not exist. Replacing a virtual file
+    /// or a hidden source is refused: it would leave the source behind, or
+    /// delete it.
     /// For a virtual image, returns the old and new paths of its source.
     pub fn rename(
         &self,
@@ -911,10 +1176,13 @@ impl Vfs {
             return Err(FsError::Denied);
         }
         let node = self.lookup(from)?;
-        let image = node.image.is_some();
+        let image = node.is_image();
         let (rf, rt) = (self.real(from)?, self.real(to)?);
         if rf == rt {
             return Ok(None);
+        }
+        if image {
+            self.deletable(from)?;
         }
         let target = self.lookup(to);
         // `to` is `from` in another case, on a case-insensitive file
@@ -927,7 +1195,7 @@ impl Vfs {
                 .is_ok_and(|t| key(&rf, &node.meta) == key(&rt, &t.meta));
         if !same {
             match target {
-                Ok(t) if t.image.is_some() || image => {
+                Ok(t) if t.is_image() || image => {
                     return Err(FsError::Denied);
                 }
                 Ok(_) if noreplace => return Err(FsError::Exists),
@@ -938,6 +1206,11 @@ impl Vfs {
             }
         }
         let (src, dst) = if image {
+            // An `.nsp` stays one: its source would become an `.xcz`.
+            let ext = |p: &Path| p.extension().map(OsStr::to_ascii_lowercase);
+            if ext(&rf) != ext(&rt) {
+                return Err(FsError::Denied);
+            }
             let dst = source_path(&rt).ok_or(FsError::Denied)?;
             if !same && fs::symlink_metadata(&dst).is_ok() {
                 return Err(FsError::Denied);
@@ -958,6 +1231,9 @@ impl Vfs {
         } else {
             fs::rename(&src, &dst)?;
         }
+        if !image && !same {
+            self.unshadow(from, &src);
+        }
         Ok(if image {
             source_path(from).zip(source_path(to))
         } else {
@@ -977,9 +1253,25 @@ impl Vfs {
         Ok(set_path_times(&path, atime, mtime)?)
     }
 
-    /// Set the permissions of `rel`, or of its source container.
+    /// Set the permissions of `rel`, or of its source container. Refused
+    /// for a symlink: it has none of its own, and the change would land on
+    /// its target. On Unix only the permission bits and the sticky bit
+    /// change, which are the ones the mount shows: set-user-ID and
+    /// set-group-ID stay as the source has them.
     pub fn set_permissions(&self, rel: &Path, perm: fs::Permissions) -> Result<()> {
         let (_, path) = self.target(rel)?;
+        let meta = fs::symlink_metadata(&path)?;
+        if meta.is_symlink() {
+            return Err(FsError::Denied);
+        }
+        #[cfg(unix)]
+        let perm = {
+            use std::os::unix::fs::PermissionsExt;
+            let kept = meta.permissions().mode() & 0o6000;
+            fs::Permissions::from_mode(kept | perm.mode() & 0o1777)
+        };
+        #[cfg(windows)]
+        let _ = meta;
         Ok(fs::set_permissions(path, perm)?)
     }
 
@@ -1179,11 +1471,14 @@ mod tests {
         assert!(matches!(v.create(p("g.nsp"), 0o644), Err(FsError::Exists)));
         assert_eq!(fs::read(dir.join("g.nsz")).unwrap(), pfs0());
 
-        // Renaming a virtual file renames its source.
-        assert!(matches!(
-            v.rename(p("g.nsp"), p("g.bin"), false),
-            Err(FsError::Denied)
-        ));
+        // Renaming a virtual file renames its source, and keeps its kind.
+        for to in ["g.bin", "g.xci", "g.nsz"] {
+            assert!(
+                matches!(v.rename(p("g.nsp"), p(to), false), Err(FsError::Denied)),
+                "{to}"
+            );
+        }
+        assert!(dir.join("g.nsz").is_file());
         assert_eq!(
             v.rename(p("g.nsp"), p("sub/H.NSP"), false).unwrap(),
             Some((p("g.nsz").into(), p("sub/H.NSZ").into()))
@@ -1321,6 +1616,275 @@ mod tests {
         }
     }
 
+    /// A symlink is an entry of its own: nothing is read, changed or deleted
+    /// through it, except the image of a container it points to.
+    #[cfg(unix)]
+    #[test]
+    fn symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let top = scratch("symlinks");
+        let (dir, out) = (top.join("src"), top.join("outside"));
+        fs::create_dir(&dir).unwrap();
+        fs::create_dir_all(out.join("sub")).unwrap();
+        fs::write(out.join("sub/data.bin"), b"data").unwrap();
+        fs::write(out.join("secret.txt"), b"secret").unwrap();
+        fs::write(out.join("c.nsz"), pfs0()).unwrap();
+        fs::write(dir.join("x.nsz"), pfs0()).unwrap();
+        for (target, link) in [
+            ("../outside", "dlink"),
+            ("../outside/secret.txt", "flink"),
+            ("nowhere", "dead"),
+            // Dangling, with the name of the virtual file of x.nsz.
+            ("nowhere", "x.nsp"),
+            ("../outside/c.nsz", "l.nsz"),
+        ] {
+            symlink(target, dir.join(link)).unwrap();
+        }
+        let p = Path::new;
+        let hide = Options {
+            hide_sources: true,
+            ..Options::default()
+        };
+        // A linked container is hidden like any other. x.nsz is not: the
+        // link x.nsp takes the name of its virtual file.
+        assert_eq!(
+            listing(&Vfs::new(dir.clone(), hide), ""),
+            ["dead", "dlink", "flink", "l.nsp", "x.nsp", "x.nsz"]
+        );
+        let v = Vfs::new(
+            dir.clone(),
+            Options {
+                rw: true,
+                hide_sources: false,
+            },
+        );
+        assert_eq!(
+            listing(&v, ""),
+            ["dead", "dlink", "flink", "l.nsp", "l.nsz", "x.nsp", "x.nsz"]
+        );
+        for link in ["dlink", "flink", "dead", "x.nsp", "l.nsz"] {
+            let node = v.lookup(p(link)).unwrap();
+            assert!(node.meta.is_symlink() && !node.is_image(), "{link}");
+            assert!(!node.is_dir(), "{link}");
+        }
+        assert_eq!(v.read_link(p("dlink")).unwrap(), p("../outside"));
+        assert_eq!(read_all(&v, "l.nsp"), pfs0());
+
+        // No read and no change goes through a link.
+        let secret = out.join("secret.txt");
+        let state = || {
+            let m = fs::metadata(&secret).unwrap();
+            (m.permissions().mode(), m.modified().unwrap())
+        };
+        let before = state();
+        let node = v.lookup(p("flink")).unwrap();
+        assert!(matches!(
+            v.open(p("flink"), node, false, false),
+            Err(FsError::Access)
+        ));
+        assert!(matches!(v.truncate(p("flink"), 0), Err(FsError::Access)));
+        for rel in ["flink", "l.nsp"] {
+            assert!(matches!(
+                v.set_permissions(p(rel), fs::Permissions::from_mode(0o600)),
+                Err(FsError::Denied)
+            ));
+        }
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let container = fs::metadata(out.join("c.nsz")).unwrap().modified().unwrap();
+        // The times of a virtual file go to its source, here a link.
+        for (rel, link) in [("flink", "flink"), ("l.nsp", "l.nsz")] {
+            v.set_times(p(rel), None, Some(t)).unwrap();
+            let link = fs::symlink_metadata(dir.join(link)).unwrap();
+            assert_eq!(link.modified().unwrap(), t, "{rel}");
+        }
+        assert_eq!(state(), before);
+        assert_eq!(v.lookup(p("l.nsp")).unwrap().mtime(), container);
+        assert_eq!(fs::read(&secret).unwrap(), b"secret");
+        assert!(matches!(v.create(p("dead"), 0o644), Err(FsError::Exists)));
+        assert!(matches!(v.mkdir(p("dead"), 0o755), Err(FsError::Exists)));
+
+        // A delete removes the link itself, also a dangling one, and also
+        // when the link is the source of a virtual file.
+        assert!(matches!(v.rmdir(p("dlink")), Err(FsError::NotDir)));
+        for link in ["dlink", "flink", "dead", "x.nsp"] {
+            assert_eq!(v.unlink(p(link)).unwrap(), None, "{link}");
+        }
+        assert_eq!(v.unlink(p("l.nsp")).unwrap(), Some(p("l.nsz").into()));
+        // x.nsp is now the virtual file of x.nsz.
+        assert_eq!(listing(&v, ""), ["x.nsp", "x.nsz"]);
+        assert!(out.join("c.nsz").is_file());
+        assert!(out.join("sub/data.bin").is_file());
+    }
+
+    /// Deleting the real file that hides a virtual one leaves the name in
+    /// the listing. A second delete must not take the source with it.
+    #[test]
+    fn shadow_delete() {
+        let dir = scratch("shadow");
+        fs::write(dir.join("g.nsz"), pfs0()).unwrap();
+        fs::write(dir.join("g.nsp"), b"real").unwrap();
+        let v = Vfs::new(
+            dir.clone(),
+            Options {
+                rw: true,
+                hide_sources: false,
+            },
+        );
+        let p = Path::new;
+        assert_eq!(v.unlink(p("g.nsp")).unwrap(), None);
+        assert_eq!(listing(&v, ""), ["g.nsp", "g.nsz"]);
+        assert!(matches!(v.unlink(p("g.nsp")), Err(FsError::Denied)));
+        assert!(dir.join("g.nsz").is_file());
+        // Later it is a delete like any other. Skipped when the clock
+        // cannot go back that far.
+        let Some(old) = Instant::now().checked_sub(UNSHADOW) else {
+            return;
+        };
+        lock(&v.unshadowed).values_mut().for_each(|t| *t = old);
+        assert_eq!(v.unlink(p("g.nsp")).unwrap(), Some(p("g.nsz").into()));
+        assert!(!dir.join("g.nsz").exists());
+    }
+
+    /// Renaming the real file away, as moving it to a trash does, reveals
+    /// the virtual one the same way. Neither a delete nor a rename of that
+    /// one may take the source with it.
+    #[test]
+    fn shadow_rename() {
+        let dir = scratch("shadow-rename");
+        fs::create_dir(dir.join("trash")).unwrap();
+        fs::write(dir.join("g.nsz"), pfs0()).unwrap();
+        fs::write(dir.join("g.nsp"), b"real").unwrap();
+        let v = Vfs::new(
+            dir.clone(),
+            Options {
+                rw: true,
+                hide_sources: false,
+            },
+        );
+        let p = Path::new;
+        assert_eq!(v.rename(p("g.nsp"), p("trash/g.nsp"), true).unwrap(), None);
+        assert_eq!(listing(&v, ""), ["g.nsp", "g.nsz", "trash"]);
+        assert!(matches!(
+            v.rename(p("g.nsp"), p("trash/h.nsp"), true),
+            Err(FsError::Denied)
+        ));
+        assert!(matches!(v.unlink(p("g.nsp")), Err(FsError::Denied)));
+        assert!(dir.join("g.nsz").is_file());
+        let Some(old) = Instant::now().checked_sub(UNSHADOW) else {
+            return;
+        };
+        lock(&v.unshadowed).values_mut().for_each(|t| *t = old);
+        v.rename(p("g.nsp"), p("trash/h.nsp"), true).unwrap();
+        assert!(dir.join("trash/h.nsz").is_file());
+    }
+
+    /// Only the permission bits, and with a chmod the sticky bit, go from
+    /// the mount to the source. A chmod leaves the set-ID bits of the source
+    /// as they are.
+    #[cfg(unix)]
+    #[test]
+    fn mode_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("modes");
+        let v = Vfs::new(
+            dir.clone(),
+            Options {
+                rw: true,
+                hide_sources: false,
+            },
+        );
+        let p = Path::new;
+        let mode = |name: &str| fs::metadata(dir.join(name)).unwrap().permissions().mode() & 0o7777;
+        let chmod = |name: &str, m| v.set_permissions(p(name), fs::Permissions::from_mode(m));
+        // The scratch directory may hand its set-group-ID bit down.
+        let inherited = mode("") & 0o2000;
+
+        // Owner bits only, which the umask of the test run leaves alone.
+        drop(v.create(p("f"), 0o6700).unwrap());
+        assert_eq!(mode("f"), 0o700);
+        chmod("f", 0o6711).unwrap();
+        assert_eq!(mode("f"), 0o711);
+
+        v.mkdir(p("d"), 0o7700).unwrap();
+        assert_eq!(mode("d"), 0o700 | inherited);
+        chmod("d", 0o755).unwrap();
+        assert_eq!(mode("d"), 0o755 | inherited);
+        // A set-group-ID directory of the source keeps the bit, which the
+        // mount does not show and a chmod through it does not name.
+        fs::set_permissions(dir.join("d"), fs::Permissions::from_mode(0o2775)).unwrap();
+        chmod("d", 0o1750).unwrap();
+        assert_eq!(mode("d"), 0o3750);
+    }
+
+    /// The images of a large directory are not all kept built: the sizes
+    /// are, and an image that was let go is built again when opened.
+    #[test]
+    fn image_cache_is_bounded() {
+        let dir = scratch("bounded");
+        let count = MAX_IMAGES + 5;
+        for i in 0..count {
+            fs::write(dir.join(format!("g{i}.nsz")), pfs0()).unwrap();
+        }
+        let v = Vfs::new(dir.clone(), Options::default());
+        assert_eq!(listing(&v, "").len(), 2 * count);
+        assert_eq!(v.cache().containers.len(), count);
+        assert_eq!(v.cache().images.len(), MAX_IMAGES);
+        // Every one opens and reads, cached or not, and the limit holds.
+        for i in 0..count {
+            assert_eq!(read_all(&v, &format!("g{i}.nsp")), pfs0(), "g{i}");
+        }
+        assert_eq!(v.cache().images.len(), MAX_IMAGES);
+        // An open file keeps its image while others take its place.
+        let rel = Path::new("g0.nsp");
+        let h = v.open(rel, v.lookup(rel).unwrap(), false, false).unwrap();
+        for i in 1..count {
+            read_all(&v, &format!("g{i}.nsp"));
+        }
+        let mut buf = [0u8; 4];
+        assert_eq!(h.read(0, &mut buf).unwrap(), 4);
+        assert_eq!(&buf, b"PFS0");
+        // A source that is gone takes its container and its image along.
+        // Not on Windows, where a deleted file may keep its name while the
+        // cached image has it open.
+        if cfg!(windows) {
+            return;
+        }
+        for i in 0..count {
+            fs::remove_file(dir.join(format!("g{i}.nsz"))).unwrap();
+        }
+        assert!(listing(&v, "").is_empty());
+        assert!(v.cache().containers.is_empty());
+        assert!(v.cache().images.is_empty());
+    }
+
+    /// A source rewritten in place with the same size and the old mtime is
+    /// still seen as changed.
+    #[cfg(unix)]
+    #[test]
+    fn changed_in_place() {
+        let dir = scratch("inplace");
+        let src = dir.join("g.nsz");
+        fs::write(&src, pfs0()).unwrap();
+        let before = fs::metadata(&src).unwrap();
+        let mtime = before.modified().unwrap();
+        let v = Vfs::new(dir, Options::default());
+        assert_eq!(read_all(&v, "g.nsp"), pfs0());
+        // Past one tick of the clock that stamps files.
+        thread::sleep(Duration::from_millis(50));
+        let mut other = pfs0();
+        let end = other.len();
+        other[end - 5..].copy_from_slice(b"WORLD");
+        fs::write(&src, &other).unwrap();
+        set_path_times(&src, None, Some(mtime)).unwrap();
+        let after = fs::metadata(&src).unwrap();
+        assert_eq!(after.modified().unwrap(), mtime);
+        if Stamp::of(&after) == Stamp::of(&before) {
+            eprintln!("the file system keeps no finer ctime, skipped");
+            return;
+        }
+        assert_eq!(read_all(&v, "g.nsp"), other);
+    }
+
     /// Two names of one file share one container, which goes away with the
     /// last name.
     #[cfg(unix)]
@@ -1332,13 +1896,13 @@ mod tests {
         let v = Vfs::new(dir.clone(), Options::default());
         v.read_dir(Path::new("")).unwrap();
         assert!(v.lookup(Path::new("B.nsp")).is_err());
-        assert_eq!(v.containers().len(), 1);
+        assert_eq!(v.cache().containers.len(), 1);
         fs::remove_file(dir.join("a.nsz")).unwrap();
         v.read_dir(Path::new("")).unwrap();
-        assert_eq!(v.containers().len(), 1);
+        assert_eq!(v.cache().containers.len(), 1);
         fs::remove_file(dir.join("B.nsz")).unwrap();
         v.read_dir(Path::new("")).unwrap();
-        assert!(v.containers().is_empty());
+        assert!(v.cache().containers.is_empty());
     }
 
     /// Many containers in one directory go through the threaded build and
@@ -1371,7 +1935,7 @@ mod tests {
         listed.sort();
         want.sort();
         assert_eq!(listed, want);
-        assert_eq!(v.containers().len(), 10);
+        assert_eq!(v.cache().containers.len(), 10);
     }
 
     /// An unreadable source is retried only after a delay.
@@ -1389,11 +1953,14 @@ mod tests {
         }
         let v = Vfs::new(dir, Options::default());
         assert!(v.lookup(Path::new("p.nsp")).is_err());
-        let c = Arc::clone(v.containers().values().next().unwrap());
+        let c = Arc::clone(v.cache().containers.values().next().unwrap());
         assert!(c.retry_at.get().is_some());
         // Within the delay the failed container is reused, not rebuilt.
         assert!(v.lookup(Path::new("p.nsp")).is_err());
-        assert!(Arc::ptr_eq(v.containers().values().next().unwrap(), &c));
+        assert!(Arc::ptr_eq(
+            v.cache().containers.values().next().unwrap(),
+            &c
+        ));
         // Leave nothing unreadable behind for tools that walk `target`.
         fs::set_permissions(&src, fs::Permissions::from_mode(0o644)).unwrap();
     }

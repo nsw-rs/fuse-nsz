@@ -32,6 +32,8 @@ signal-hook = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 winfsp_wrs = "0.4.1"
+# Only for the error table of WinFsp, which winfsp_wrs does not hand on.
+winfsp_wrs_sys = "0.4.1"
 
 [dev-dependencies]
 sha2 = "0.10"

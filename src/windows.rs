@@ -5,16 +5,20 @@
 //! WinFsp backend for Windows. WinFsp passes paths like `\dir\file`, which
 //! map directly onto the core.
 
-use crate::vfs::{self, FsError, Handle, Node, Options, Vfs, lock};
-use std::ffi::OsString;
+use crate::vfs::{self, FsError, Handle, Node, Options, Vfs, lock, log};
+use std::ffi::{OsString, c_void};
+use std::io;
+use std::ops::Deref;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::ptr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 use winfsp_wrs::{
-    CleanupFlags, CreateFileInfo, CreateOptions, DirInfo, ERROR_DIR_NOT_EMPTY, ERROR_DISK_FULL,
-    ERROR_HANDLE_DISK_FULL, ERROR_SHARING_VIOLATION, FileAccessRights, FileAttributes, FileInfo,
-    FileSystem, FileSystemInterface, NTSTATUS, PSecurityDescriptor, Params, STATUS_ACCESS_DENIED,
+    CleanupFlags, CloseHandle, CreateFileInfo, CreateOptions, DirInfo, ERROR_DIR_NOT_EMPTY,
+    ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL, ERROR_SHARING_VIOLATION, FileAccessRights,
+    FileAttributes, FileContextKind, FileContextMode, FileInfo, FileSystem, FileSystemInterface,
+    HANDLE, LocalFree, NTSTATUS, PSecurityDescriptor, Params, STATUS_ACCESS_DENIED,
     STATUS_DIRECTORY_NOT_EMPTY, STATUS_DISK_FULL, STATUS_END_OF_FILE, STATUS_FILE_IS_A_DIRECTORY,
     STATUS_IO_DEVICE_ERROR, STATUS_MEDIA_WRITE_PROTECTED, STATUS_NOT_A_DIRECTORY,
     STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_SHARING_VIOLATION,
@@ -23,13 +27,19 @@ use winfsp_wrs::{
 
 /// Read and execute for everyone, on a read-only volume.
 const SDDL_RO: &U16CStr = u16cstr!("O:BAG:BAD:P(A;;FRFX;;;WD)");
-/// Full access for everyone, on a read-write volume.
-const SDDL_RW: &U16CStr = u16cstr!("O:BAG:BAD:P(A;;FA;;;WD)");
 /// A virtual image on a read-write volume: read and execute, plus delete
 /// and write attributes so it can be renamed, deleted and touched. Without
 /// write data, an open asking for the most access allowed still gets a
 /// read-only handle.
-const SDDL_IMAGE: &U16CStr = u16cstr!("O:BAG:BAD:P(A;;0x1301a9;;;WD)");
+const IMAGE_ACCESS: &str = "0x1301a9";
+
+/// The descriptor of a read-write volume. Every request is carried out with
+/// the rights of the user who mounted, whatever the permissions of the
+/// source say, so only that user, the system and the administrators get
+/// `access`. Everyone else reads, as on a read-only volume.
+fn sddl_rw(user: &str, access: &str) -> String {
+    format!("O:BAG:BAD:P(A;;{access};;;{user})(A;;{access};;;SY)(A;;{access};;;BA)(A;;FRFX;;;WD)")
+}
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -39,6 +49,72 @@ unsafe extern "system" {
         total: *mut u64,
         free: *mut u64,
     ) -> i32;
+    fn GetCurrentProcess() -> HANDLE;
+}
+
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    fn OpenProcessToken(process: HANDLE, access: u32, token: *mut HANDLE) -> i32;
+    fn GetTokenInformation(
+        token: HANDLE,
+        class: u32,
+        info: *mut c_void,
+        len: u32,
+        needed: *mut u32,
+    ) -> i32;
+    fn ConvertSidToStringSidW(sid: *const c_void, text: *mut *mut u16) -> i32;
+}
+
+/// The SID of the user this process runs as, in the text form SDDL takes.
+fn user_sid() -> Result<String, String> {
+    const TOKEN_QUERY: u32 = 8;
+    /// The `TokenUser` information class.
+    const TOKEN_USER: u32 = 1;
+    let failed = |what: &str| format!("{what}: {}", io::Error::last_os_error());
+    let mut token: HANDLE = 0;
+    // SAFETY: the pseudo handle of this process needs no close, and `token`
+    // is a valid place for the result.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(failed("OpenProcessToken"));
+    }
+    // A TOKEN_USER is a pointer and a flags word, followed by the SID the
+    // pointer leads to, which is at most 68 bytes. The u64 items give the
+    // alignment the pointer needs.
+    let mut info = [0u64; 16];
+    let mut needed = 0;
+    // SAFETY: `info` is writable for the length given.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TOKEN_USER,
+            info.as_mut_ptr().cast(),
+            size_of_val(&info) as u32,
+            &mut needed,
+        )
+    };
+    let r = if ok == 0 {
+        Err(failed("GetTokenInformation"))
+    } else {
+        Ok(())
+    };
+    // SAFETY: `token` was opened above and is not used after this.
+    unsafe { CloseHandle(token) };
+    r?;
+    // SAFETY: the call filled `info` with a TOKEN_USER, whose first field
+    // is the pointer to the SID.
+    let sid = unsafe { info.as_ptr().cast::<*const c_void>().read() };
+    let mut text = ptr::null_mut();
+    // SAFETY: `sid` is a valid SID inside `info`, and `text` a valid place
+    // for the result.
+    if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
+        return Err(failed("ConvertSidToStringSidW"));
+    }
+    // SAFETY: on success `text` is a NUL terminated string that the caller
+    // frees with LocalFree.
+    let s = unsafe { U16CStr::from_ptr_str(text) }.to_string_lossy();
+    // SAFETY: allocated by the call above and not used after this.
+    unsafe { LocalFree(text.cast()) };
+    Ok(s)
 }
 
 /// Win32 epoch (1601) to Unix epoch, in 100 ns units.
@@ -57,7 +133,13 @@ fn status(e: FsError) -> NTSTATUS {
             Some(ERROR_DIR_NOT_EMPTY) => STATUS_DIRECTORY_NOT_EMPTY,
             Some(ERROR_SHARING_VIOLATION) => STATUS_SHARING_VIOLATION,
             Some(ERROR_DISK_FULL | ERROR_HANDLE_DISK_FULL) => STATUS_DISK_FULL,
-            _ => STATUS_IO_DEVICE_ERROR,
+            // The table of WinFsp for the rest: as a device error, which
+            // clients show as a hardware fault, they would all look alike.
+            // SAFETY: a lookup in the WinFsp DLL, which `mount` loads
+            // before any request is served.
+            Some(code) => unsafe { winfsp_wrs_sys::FspNtStatusFromWin32(code) },
+            // Not from the OS: an image that cannot be decoded.
+            None => STATUS_IO_DEVICE_ERROR,
         },
     }
 }
@@ -139,6 +221,51 @@ impl Ctx {
     }
 }
 
+/// The file context WinFsp hands to a callback. It has none for a flush of
+/// the whole volume, which a plain `Arc` context would take for a file and
+/// crash on.
+struct Open(Option<Arc<Ctx>>);
+
+impl FileContextKind for Open {
+    const MODE: FileContextMode = FileContextMode::Descriptor;
+
+    unsafe fn write(self, out: *mut *mut c_void) {
+        let raw = self.0.map_or(ptr::null(), Arc::into_raw);
+        // SAFETY: the caller gives a valid place for the context.
+        unsafe { out.write(raw.cast_mut().cast()) }
+    }
+
+    unsafe fn access(raw: *mut c_void) -> Self {
+        if raw.is_null() {
+            return Open(None);
+        }
+        // SAFETY: a context that is not null came from `write`, and WinFsp
+        // keeps it until the close. The count taken here is the one this
+        // value gives back when dropped.
+        unsafe {
+            Arc::increment_strong_count(raw.cast_const().cast::<Ctx>());
+            Self::access_for_close(raw)
+        }
+    }
+
+    unsafe fn access_for_close(raw: *mut c_void) -> Self {
+        // SAFETY: as in `access`. This takes over the count `write` left
+        // with WinFsp.
+        Open(Some(unsafe {
+            Arc::from_raw(raw.cast_const().cast::<Ctx>())
+        }))
+    }
+}
+
+impl Deref for Open {
+    type Target = Ctx;
+
+    /// Only a flush comes without a context, and it checks for that.
+    fn deref(&self) -> &Ctx {
+        self.0.as_deref().expect("a file context")
+    }
+}
+
 struct NszFs {
     vfs: Vfs,
     security: SecurityDescriptor,
@@ -164,7 +291,7 @@ impl NszFs {
         let node = match &ctx.handle {
             Some(Handle::File(f)) => Node {
                 meta: f.metadata().map_err(|e| status(e.into()))?,
-                image: None,
+                image_len: None,
             },
             _ => self.vfs.lookup(&ctx.path()).map_err(status)?,
         };
@@ -198,7 +325,7 @@ impl NszFs {
 }
 
 impl FileSystemInterface for NszFs {
-    type FileContext = Arc<Ctx>;
+    type FileContext = Open;
 
     const GET_VOLUME_INFO_DEFINED: bool = true;
     const GET_SECURITY_BY_NAME_DEFINED: bool = true;
@@ -245,7 +372,7 @@ impl FileSystemInterface for NszFs {
         let node = self.vfs.lookup(&rel(file_name)).map_err(status)?;
         Ok((
             self.info(&node).file_attributes(),
-            self.security(node.image.is_some()),
+            self.security(node.is_image()),
             false,
         ))
     }
@@ -267,7 +394,7 @@ impl FileSystemInterface for NszFs {
             (node, Some(h))
         };
         let info = self.info(&node);
-        Ok((Ctx::new(path, info, handle), info))
+        Ok((Open(Some(Ctx::new(path, info, handle))), info))
     }
 
     /// Truncate on open (supersede or overwrite dispositions).
@@ -305,7 +432,7 @@ impl FileSystemInterface for NszFs {
             }
             let write = granted_access.is(FileAccessRights::FILE_WRITE_DATA)
                 || granted_access.is(FileAccessRights::FILE_APPEND_DATA);
-            let image = node.image.is_some();
+            let image = node.is_image();
             let r = match self.vfs.open(&path, node.clone(), write, false) {
                 // The security descriptor grants write data, so an open
                 // asking for MAXIMUM_ALLOWED gets it even on a source the
@@ -316,22 +443,24 @@ impl FileSystemInterface for NszFs {
             };
             Some(r.map_err(status)?)
         };
-        Ok((Ctx::new(path, info, handle), info))
+        Ok((Open(Some(Ctx::new(path, info, handle))), info))
     }
 
     /// The last handle of a file is closed: delete it if asked to.
-    fn cleanup(&self, ctx: Self::FileContext, _file_name: Option<&U16CStr>, flags: CleanupFlags) {
+    fn cleanup(&self, ctx: Self::FileContext, file_name: Option<&U16CStr>, flags: CleanupFlags) {
         if !flags.is(CleanupFlags::DELETE) {
             return;
         }
-        let path = ctx.path();
+        // The name WinFsp sends with a delete is the current one. The path
+        // kept in the context misses a rename made through another handle.
+        let path = file_name.map_or_else(|| ctx.path(), rel);
         let r = if ctx.handle.is_some() {
             self.vfs.unlink(&path).map(drop)
         } else {
             self.vfs.rmdir(&path)
         };
         if let Err(e) = r {
-            eprintln!("{}: delete: {e:?}", path.display());
+            log!("{}: delete: {e:?}", path.display());
         }
     }
 
@@ -359,6 +488,11 @@ impl FileSystemInterface for NszFs {
     }
 
     fn flush(&self, ctx: Self::FileContext) -> Result<FileInfo, NTSTATUS> {
+        // The whole volume: nothing is buffered here, every write went
+        // straight to the source.
+        let Some(ctx) = ctx.0 else {
+            return Ok(FileInfo::default());
+        };
         if let Some(h) = &ctx.handle {
             h.sync().map_err(status)?;
         }
@@ -378,11 +512,7 @@ impl FileSystemInterface for NszFs {
             Ok(0) if !buffer.is_empty() => Err(STATUS_END_OF_FILE),
             Ok(n) => Ok(n),
             Err(e) => {
-                eprintln!(
-                    "{}: read {}@{offset}: {e}",
-                    ctx.path().display(),
-                    buffer.len()
-                );
+                vfs::log_read_error(&ctx.path(), buffer.len(), offset, &e);
                 Err(STATUS_IO_DEVICE_ERROR)
             }
         }
@@ -435,12 +565,17 @@ impl FileSystemInterface for NszFs {
         self.refresh(&ctx)
     }
 
-    fn can_delete(&self, ctx: Self::FileContext, _file_name: &U16CStr) -> Result<(), NTSTATUS> {
+    fn can_delete(&self, ctx: Self::FileContext, file_name: &U16CStr) -> Result<(), NTSTATUS> {
         if !self.vfs.rw() {
             return Err(STATUS_MEDIA_WRITE_PROTECTED);
         }
-        if ctx.handle.is_none() && !self.vfs.is_empty_dir(&ctx.path()).map_err(status)? {
+        // The current name, as in `cleanup`.
+        let path = rel(file_name);
+        if ctx.handle.is_none() && !self.vfs.is_empty_dir(&path).map_err(status)? {
             return Err(STATUS_DIRECTORY_NOT_EMPTY);
+        }
+        if matches!(ctx.handle, Some(Handle::Image(_))) {
+            self.vfs.deletable(&path).map_err(status)?;
         }
         Ok(())
     }
@@ -503,8 +638,14 @@ pub fn mount(src: PathBuf, mountpoint: &Path, args: &[String]) -> Result<(), Str
         }
     }
     winfsp_wrs::init().map_err(|e| e.to_string())?;
-    let security = SecurityDescriptor::from_wstr(if opts.rw { SDDL_RW } else { SDDL_RO })?;
-    let image_security = SecurityDescriptor::from_wstr(SDDL_IMAGE)?;
+    let user = user_sid()?;
+    let sddl = |access| U16CString::from_str_truncate(sddl_rw(&user, access));
+    let security = if opts.rw {
+        SecurityDescriptor::from_wstr(&sddl("FA"))?
+    } else {
+        SecurityDescriptor::from_wstr(SDDL_RO)?
+    };
+    let image_security = SecurityDescriptor::from_wstr(&sddl(IMAGE_ACCESS))?;
     let mut params = Params::default();
     let vp = &mut params.volume_params;
     vp.set_sector_size(4096)

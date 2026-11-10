@@ -4,7 +4,7 @@
 
 [package]
 name = "fuse-nsz"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.89"
 description = "FUSE filesystem that shows NSZ/XCZ files as plain NSP/XCI"
